@@ -1,0 +1,3 @@
+2026-11-20 17:43:54.387 CST [2544,coord(0,0)] LOG:  InitMultinodeExecutor force:0.
+2026-11-20 17:43:54.411 CST [2416,coord(0,0)] WARNING:  because tcp fails to send data, force kill SIGTERM to pid 2544
+2026-11-20 17:43:54.411 CST [2544,coord(2533,76)] FATAL:  terminating connection due to administrator command

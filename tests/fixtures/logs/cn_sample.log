@@ -1,0 +1,9 @@
+2026-11-20 17:38:53.307 CST [2277,coord(2277,0)] FATAL:  the database system is in recovery mode
+2026-11-20 17:40:25.276 CST [2334,coord(2334,11)] ERROR:  default group not defined
+2026-11-20 17:41:12.628 CST [2289,coord(2289,0)] FATAL:  terminating connection due to administrator command
+2026-11-20 17:42:36.474 CST [2472,coord(2472,33)] ERROR:  default group not defined
+2026-11-20 17:43:54.411 CST [2533,coord(2533,76)] LOG:  Changing connection state for node dn0002 pid: 2544, state ERROR ==> FATAL, invoker execRemote.c: 862
+2026-11-20 17:43:54.414 CST [2533,coord(2533,76)] LOG:  Changing connection state for node dn0001 pid: 2545, state FATAL ==> FATAL, invoker execRemote.c: 862
+2026-11-20 18:01:00.000 CST [2900,coord(2900,5)] ERROR:  (28000) role "nobody" does not exist
+not-a-valid-log-line just text
+2026-11-20 18:02:00.000 CST [2901,coord(2901,6)] ERROR:  (42704) PGXC Group nonexist_group: group not defined
