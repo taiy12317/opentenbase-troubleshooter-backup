@@ -1,0 +1,22 @@
+input: 
+matched: None
+confidence: None
+conclusion: 时间窗口内发现 8 条 ERROR/FATAL 事件。分类：node_state×4、distribution×3、auth×1。需结合发生时间与跨节点关联判断是否与当前故障相关。跨节点关联（confirmed/candidate/insufficient）只说明两侧日志是否属于同一执行上下文，不等于故障根因已确认；根因结论须结合错误签名与验证步骤。
+errors_in_window: 8  category_counts={'node_state': 4, 'distribution': 3, 'auth': 1}
+  [2026-11-20T09:38:53.307+00:00] coordinator FATAL: the database system is in recovery mode
+  [2026-11-20T09:40:25.276+00:00] coordinator ERROR: default group not defined
+  [2026-11-20T09:41:12.628+00:00] coordinator FATAL: terminating connection due to administrator command
+  [2026-11-20T09:42:36.474+00:00] coordinator ERROR: default group not defined
+  [2026-11-20T10:01:00.000+00:00] coordinator ERROR: (28000) role "nobody" does not exist
+  [2026-11-20T10:02:00.000+00:00] coordinator ERROR: (42704) PGXC Group nonexist_group: group not defined
+  [2026-11-20T09:43:54.411+00:00] datanode FATAL: terminating connection due to administrator command
+  [2026-11-20T09:43:54.411+00:00] datanode FATAL: terminating connection due to administrator command
+correlations: 7
+  [confirmed] coord=2533,76 reason=CN 同 coord 记录与时间窗口内的 DN WARNING 及以上事件配对；只确认上下文关联，不确认因果或根因
+  [insufficient] coord=2901,6 reason=DN 侧日志无同 coord 记录（DN 日志缺失/轮转/未记录，或对侧事件在请求窗口外）
+  [insufficient] coord=2900,5 reason=DN 侧日志无同 coord 记录（DN 日志缺失/轮转/未记录，或对侧事件在请求窗口外）
+  [insufficient] coord=2472,33 reason=DN 侧日志无同 coord 记录（DN 日志缺失/轮转/未记录，或对侧事件在请求窗口外）
+  [insufficient] coord=2289,0 reason=DN 侧日志无同 coord 记录（DN 日志缺失/轮转/未记录，或对侧事件在请求窗口外）
+  [insufficient] coord=2334,11 reason=DN 侧日志无同 coord 记录（DN 日志缺失/轮转/未记录，或对侧事件在请求窗口外）
+  [insufficient] coord=2277,0 reason=DN 侧日志无同 coord 记录（DN 日志缺失/轮转/未记录，或对侧事件在请求窗口外）
+root_cause: determined=False note=跨节点关联（confirmed/candidate/insufficient）只说明两侧日志是否属于同一执行上下文；关联确认不等于故障根因已确认。根因需结合错误签名与验证步骤确认，本工具只提供证据，不自动判定根因。

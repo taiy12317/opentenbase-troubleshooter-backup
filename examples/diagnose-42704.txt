@@ -1,0 +1,8 @@
+input: 42704
+matched: True
+confidence: confirmed
+sqlstate: undefined_object
+possible_causes: ['当前 search_path 可见范围内不存在所引用的对象（对象可能存在于其他 schema）', '对象确实不存在（名称拼写、大小写或目标库错误）', 'OpenTenBase 特有文本：PGXC Group ...: group not defined（节点组未定义）']
+next_steps: ['按对象类型查 pg_class/pg_type/pg_proc/pg_namespace 核对对象是否存在及其 schema', '核对 SHOW search_path 与原始 SQL 是否带 schema 限定', 'PGXC Group 场景核对 pgxc_group']
+otb_note: reproduced: 实验集群实测两类 42704——类型在 search_path 外（SET search_path=pg_catalog 后 'memories'::regtype 报 type "memories" does not exist）与 PGXC Group not defined；42704 为名称解析失败类别，不指向单一根因
+conclusion: SQLSTATE 42704（undefined_object）标识错误类别，不是单一根因；同一错误码可由不同原因触发，需结合完整错误文本与原始 SQL 才能定位根因。
