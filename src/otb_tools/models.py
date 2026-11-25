@@ -1,17 +1,20 @@
 """统一结果模型与退出码语义。
 
-退出码约定（CLI 全子命令一致）：
-  0  执行成功且未发现 FAIL 级问题（WARN 允许存在，不触发非零）
-  1  发现明确的 FAIL（健康检查判定异常；诊断命中 FAIL 级确认签名/确认关联）
-  2  工具执行失败或关键检查未完成（存在 ERROR 项，优先级最高）
-  3  参数错误
-  --strict 模式下 WARN 也触发退出码 1（ERROR 仍为 2，FAIL 仍为 1）。
+退出码约定：
+  preflight / inspect（健康检查）：
+    0  无 FAIL 级问题（WARN 允许；--strict 时 WARN 计 1）
+    1  存在 FAIL
+    2  存在 ERROR（执行失败或关键检查未完成）
+    3  参数错误
+  diagnose（离线分析）：
+    0  分析完成
+    1  --strict 检测模式命中 FAIL/WARN 签名或 confirmed 关联
+    2  证据不完整（日志文件读取失败或全部行无法解析）
+    3  参数错误
 
-历史 ERROR/FATAL 日志仅因存在不构成 FAIL；必须结合时间窗口与跨节点确认。
 子进程自身的退出码（如共享库缺失的 127）只作为证据记录，不透传为工具退出码。
-
 JSON 输出同时提供 execution_status（工具是否执行完成）与 health_status（目标是否健康），
-避免把"工具执行失败"与"数据库不健康"混为一谈。
+区分"工具执行失败"与"数据库不健康"。
 """
 
 from __future__ import annotations
@@ -62,10 +65,8 @@ class Item:
 
 @dataclass
 class Correlation:
-    """跨节点日志关联结果。confidence: confirmed / candidate / insufficient。
-
-    注意：confidence 只回答"两侧日志是否属于同一执行上下文"（关联可靠性），
-    不回答"故障根因是否已确认"（诊断证据）。关联 confirmed 不等于根因确定。
+    """跨节点日志关联结果。confidence: confirmed / candidate / insufficient，
+    表示两侧日志是否属于同一执行上下文。根因判定由错误签名匹配给出。
     """
 
     coord: str
@@ -107,15 +108,17 @@ class Report:
         return "failed" if any(i.status == Status.ERROR for i in self.items) else "ok"
 
     def health_status(self) -> str:
-        """目标是否健康。ERROR 时无法判定为 unknown；FAIL→failed；WARN→degraded。"""
+        """目标是否健康。ERROR 或全部 SKIP（无数据）→ unknown；FAIL→failed；WARN→degraded。"""
         codes = [i.status for i in self.items]
-        if Status.ERROR in codes:
+        if Status.ERROR in codes or not codes:
             return "unknown"
         if Status.FAIL in codes:
             return "failed"
         if Status.WARN in codes:
             return "degraded"
-        return "healthy"
+        if any(i.status == Status.PASS for i in self.items):
+            return "healthy"
+        return "unknown"
 
     def summary(self) -> dict:
         counts = {s.value: 0 for s in Status}
@@ -186,7 +189,7 @@ class Report:
                     lines.append(f"建议：{i.fix_hint}")
         if self.correlations:
             lines.append("")
-            lines.append("## 跨节点日志关联（关联确认 ≠ 根因确认）")
+            lines.append("## 跨节点日志关联")
             lines.append("")
             lines.append("| 置信度 | coord | 说明 |")
             lines.append("|---|---|---|")

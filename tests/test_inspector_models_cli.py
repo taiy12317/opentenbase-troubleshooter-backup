@@ -3,7 +3,7 @@ import os
 
 import pytest
 
-from otb_tools import cli, inspector
+from otb_tools import cli, inspector, net
 from otb_tools.models import Item, Report, Status
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -129,9 +129,9 @@ class TestInspectorUnit:
         def fake_run_sql(conn, sql, params=None):
             if "FROM pgxc_node" in sql:
                 return [
-                    ("cn0001", "C", 15001, "127.0.0.1", True),
-                    ("dn0001", "D", 15401, "127.0.0.1", True),
-                ], ["node_name", "node_type", "node_port", "node_host", "nodeis_primary"]
+                    (100, "cn0001", "C", 15001, "127.0.0.1", True, 0),
+                    (101, "dn0001", "D", 15401, "127.0.0.1", True, 1),
+                ], ["oid", "node_name", "node_type", "node_port", "node_host", "nodeis_primary", "node_id"]
             if "FROM pgxc_group" in sql:
                 return [("default_group", 0, 0)], ["group_name", "group_id", "group_members"]
             if "current_setting" in sql:
@@ -140,7 +140,7 @@ class TestInspectorUnit:
 
         monkeypatch.setattr(inspector, "connect", fake_connect)
         monkeypatch.setattr(inspector, "run_sql", fake_run_sql)
-        monkeypatch.setattr(inspector, "_ss_listening_ports", lambda: {15001, 15401})
+        monkeypatch.setattr(net, "ss_listening_ports", lambda: {15001, 15401})
         monkeypatch.setattr(inspector, "_run", lambda cmd, timeout=5: (0, "", ""))
         cfg = inspector.InspectorConfig(
             conninfo="host=127.0.0.1 port=15001 user=student",
@@ -161,7 +161,7 @@ class TestInspectorUnit:
         assert p1.status == Status.SKIP  # 未提供 --ports
 
         cfg.ports = [15001, 15999]
-        monkeypatch.setattr(inspector, "_ss_listening_ports", lambda: {15001})
+        monkeypatch.setattr(net, "ss_listening_ports", lambda: {15001})
         r2 = Report(command="inspect")
         inspector._append_node_level_checks(r2, cfg)
         p2 = {i.id: i for i in r2.items}["pgxc.reg_vs_ports"]
@@ -199,6 +199,11 @@ class TestModels:
         assert err.execution_status() == "failed"
         assert err.health_status() == "unknown"
 
+    def test_health_status_all_skip_unknown(self):
+        r = Report(command="x", items=[Item(id="a", name="a", status=Status.SKIP)])
+        assert r.execution_status() == "ok"
+        assert r.health_status() == "unknown"  # 全部 SKIP 无数据，不判健康
+
     def test_json_structure(self):
         r = Report(command="preflight", items=[Item(id="a", name="a", status=Status.PASS)])
         d = json.loads(r.to_json())
@@ -225,6 +230,24 @@ class TestCli:
             cli.main(["preflight", "--ports", "not-a-port"])
         assert ei.value.code == 3
 
+    def test_preflight_port_out_of_range_exit_3(self):
+        with pytest.raises(SystemExit) as ei:
+            cli.main(["preflight", "--ports", "70000"])
+        assert ei.value.code == 3
+
+    def test_inspect_watermark_threshold_out_of_range_exit_3(self):
+        with pytest.raises(SystemExit) as ei:
+            cli.main(["inspect", "--watermark-threshold", "1.5"])
+        assert ei.value.code == 3
+
+    def test_diagnose_window_hours_non_positive_exit_3(self):
+        with pytest.raises(SystemExit) as ei:
+            cli.main(["diagnose", "--cn-logs", "x.log", "--window-hours", "0"])
+        assert ei.value.code == 3
+
+    def test_diagnose_text_and_logs_mixed_exit_3(self):
+        assert cli.main(["diagnose", "--text", "Connection refused", "--cn-logs", "x.log"]) == 3
+
     def test_unknown_command_exit_3(self):
         with pytest.raises(SystemExit) as ei:
             cli.main(["no-such-command"])
@@ -241,14 +264,14 @@ class TestCli:
     def test_diagnose_unknown_sqlstate_exit_0(self, capsys):
         rc = cli.main(["diagnose", "--sqlstate", "0A999"])
         assert rc == 0
-        assert "无法确定根因" in capsys.readouterr().out
+        assert "不在当前案例库中" in capsys.readouterr().out
 
     def test_diagnose_text_file_missing_exit_2(self, capsys):
         rc = cli.main(["diagnose", "--text-file", "/nonexistent/file.txt"])
         assert rc == 2
 
     def test_diagnose_logs_fixtures_exit_0_and_strict(self, capsys):
-        # 历史关联事件成功识别也返回 0（分析完成，不等于当前故障）；--strict 检测模式返回 1
+        # 历史关联事件成功识别也返回 0（分析完成即 0）；--strict 检测模式返回 1
         args = [
             "diagnose",
             "--cn-logs", os.path.join(FIX, "logs", "cn_sample.log"),
@@ -273,7 +296,7 @@ class TestCli:
             p.chmod(0o755)
         os.makedirs(tmp_path / "data", exist_ok=True)
         os.makedirs(tmp_path / "logs", exist_ok=True)
-        monkeypatch.setattr(preflight, "_ss_listening_ports", lambda: set())
+        monkeypatch.setattr(net, "ss_listening_ports", lambda: set())
         monkeypatch.setattr(preflight, "_run", lambda cmd, env=None, timeout=10: (0, "\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6", ""))
         rc = cli.main([
             "preflight",
@@ -299,7 +322,7 @@ class TestCli:
         os.makedirs(tmp_path / "data", exist_ok=True)
         os.makedirs(tmp_path / "logs", exist_ok=True)
         monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
-        monkeypatch.setattr(preflight, "_ss_listening_ports", lambda: set())
+        monkeypatch.setattr(net, "ss_listening_ports", lambda: set())
         monkeypatch.setattr(preflight, "_run", lambda cmd, env=None, timeout=10: (0, "\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6", ""))
         base = [
             "preflight",
@@ -324,7 +347,7 @@ class TestCli:
             ports=[],
             conninfo="host=127.0.0.1 port=15001",
         )
-        monkeypatch.setattr(preflight, "_ss_listening_ports", lambda: set())
+        monkeypatch.setattr(net, "ss_listening_ports", lambda: set())
         monkeypatch.setattr(preflight, "_run", lambda cmd, env=None, timeout=10: (0, "1", ""))
         report = preflight.run(cfg)
         ids = [i.id for i in report.items]
@@ -354,7 +377,7 @@ class TestCli:
         assert any(m["id"] == "connection-refused-generic" for m in d["matches"])
         # 通用类别签名不得把节点宕机当作确定结论
         causes = "".join(m["possible_causes"][0] for m in d["matches"])
-        assert "无法仅凭该文本判断" in causes
+        assert "需结合端口监听状态与实际连接串区分" in causes
 
     def test_diagnose_bare_log_files_scan_only(self, tmp_path, capsys):
         from datetime import datetime, timezone
@@ -394,3 +417,39 @@ class TestCli:
         assert other == ["gtm.log"]
         cn2, dn2, other2 = _classify_log_files({"/var/log/scanner.log": "/var/log/scanner.log"})
         assert cn2 == [] and dn2 == [] and other2 == ["/var/log/scanner.log"]
+
+    def test_diagnose_garbage_log_file_exit_2(self, tmp_path, capsys):
+        path = tmp_path / "garbage.log"
+        path.write_text("not a valid log line\n")
+        rc = cli.main(["diagnose", "--log-files", str(path)])
+        out = capsys.readouterr().out
+        assert rc == 2  # 全部行无法解析：证据不完整
+        assert "unparsed_files: 1" in out
+        assert "格式与解析器不匹配" in out
+
+    def test_diagnose_output_unwritable_exit_2(self, capsys):
+        rc = cli.main(["diagnose", "--sqlstate", "42704", "-o", "/nonexistent-dir/out.txt"])
+        assert rc == 2
+
+    def test_preflight_output_unwritable_exit_2(self, tmp_path, monkeypatch):
+        from otb_tools import preflight
+
+        os.makedirs(tmp_path / "bin", exist_ok=True)
+        for tool in ["postgres", "psql", "gtm_ctl", "pg_ctl"]:
+            p = tmp_path / "bin" / tool
+            p.write_text("#!/bin/sh\n")
+            p.chmod(0o755)
+        os.makedirs(tmp_path / "data", exist_ok=True)
+        os.makedirs(tmp_path / "logs", exist_ok=True)
+        monkeypatch.setattr(net, "ss_listening_ports", lambda: set())
+        monkeypatch.setattr(preflight, "_run", lambda cmd, env=None, timeout=10: (0, "\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6", ""))
+        rc = cli.main([
+            "preflight",
+            "--pg-bin", str(tmp_path / "bin"),
+            "--runtime-libpq", str(tmp_path / "runtime"),
+            "--data-dirs", str(tmp_path / "data"),
+            "--log-dir", str(tmp_path / "logs"),
+            "--ports", "5000",
+            "-o", os.path.join(str(tmp_path), "no-such-dir", "out.txt"),
+        ])
+        assert rc == 2  # 检查本身通过，但报告写入失败

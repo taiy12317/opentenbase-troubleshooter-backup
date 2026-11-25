@@ -65,6 +65,17 @@ class TestParseFile:
         assert len(entries) == 8
         assert unparsed == 1
 
+    def test_blank_lines_not_counted_unparsed(self, tmp_path):
+        p = tmp_path / "with_blanks.log"
+        p.write_text(
+            "2026-11-20 17:43:54.411 CST [2545,coord(2533,76)] FATAL:  terminating connection due to administrator command\n"
+            "\n"
+            "not-a-valid-log-line just text\n"
+        )
+        entries, unparsed = log_parser.parse_file(str(p), node="cn")
+        assert len(entries) == 1
+        assert unparsed == 1
+
     def test_missing_file_raises(self):
         with pytest.raises(OSError):
             log_parser.parse_file(os.path.join(FIX, "does_not_exist.log"))

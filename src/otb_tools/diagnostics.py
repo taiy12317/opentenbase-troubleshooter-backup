@@ -4,7 +4,7 @@
   confirmed    - 文本/日志直接命中的已知签名（基于实测或社区证据库）；
   candidate    - 依据签名提出但未经直接证据确认的可能原因；
   hypothesis   - 需要进一步验证的假设。
-证据不足时明确输出「无法确定根因」。
+未命中已知签名时结论为 insufficient，并说明可补充的证据（完整错误文本或日志）。
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ def diagnose_sqlstate(code: str) -> dict:
         return {
             "input": code.upper(),
             "matched": False,
-            "conclusion": f"SQLSTATE {code.upper()} 不在当前案例库中，无法确定根因。可提供完整错误文本或日志进一步诊断。",
+            "conclusion": f"SQLSTATE {code.upper()} 不在当前案例库中。可提供完整错误文本或日志继续诊断。",
             "confidence": "insufficient",
         }
     return {
@@ -44,8 +44,8 @@ def diagnose_sqlstate(code: str) -> dict:
         "next_steps": case["next"],
         "otb_note": case["otb_note"],
         "conclusion": (
-            f"SQLSTATE {code.upper()}（{case['name']}）标识错误类别，不是单一根因；"
-            "同一错误码可由不同原因触发，需结合完整错误文本与原始 SQL 才能定位根因。"
+            f"SQLSTATE {code.upper()}（{case['name']}）标识错误类别；"
+            "同一错误码可由不同原因触发，结合完整错误文本与原始 SQL 定位具体原因。"
         ),
         "confidence": "confirmed" if case["otb_note"].startswith("reproduced") else "candidate",
     }
@@ -57,7 +57,7 @@ def diagnose_text(text: str) -> dict:
         return {
             "input": text[:200],
             "matched": False,
-            "conclusion": "未命中已知失败签名，无法确定根因。可提供 SQLSTATE 或相关节点日志进一步诊断。",
+            "conclusion": "未命中已知失败签名。可提供 SQLSTATE 或相关节点日志继续诊断。",
             "confidence": "insufficient",
         }
     # 分层匹配：具体签名命中时覆盖同症状的通用类别签名（后者只识别类别不定位根因）
@@ -81,9 +81,9 @@ def diagnose_logs(
 ) -> dict:
     """解析日志、分类统计、输出 ERROR/FATAL 明细与跨节点关联。
 
-    other_paths 中的文件只做错误扫描，不参与跨节点关联（角色未知时不得猜测）。
-    关联置信度（confirmed/candidate/insufficient）只表示两侧日志是否同属一个
-    执行上下文；关联确认不等于故障根因确认，conclusion 中明确区分。
+    other_paths 中的文件只做错误扫描，不参与跨节点关联。
+    关联置信度（confirmed/candidate/insufficient）表示两侧日志是否同属一个
+    执行上下文；根因判定由错误签名匹配与验证步骤给出。
     """
     cutoff = log_parser.now_utc() - window
     entries: list[LogEntry] = []
@@ -91,6 +91,7 @@ def diagnose_logs(
     dn_entries: list[LogEntry] = []
     unparsed_total = 0
     read_errors: list[str] = []
+    format_mismatch: list[str] = []
 
     for path, role in list(zip(cn_paths, ["coordinator"] * len(cn_paths))) + \
             list(zip(dn_paths, ["datanode"] * len(dn_paths))):
@@ -100,6 +101,8 @@ def diagnose_logs(
             read_errors.append(f"{path}: {exc}")
             continue
         unparsed_total += unparsed
+        if not es and unparsed > 0:
+            format_mismatch.append(path)
         for e in es:
             entries.append(e)
             (cn_entries if role == "coordinator" else dn_entries).append(e)
@@ -110,6 +113,8 @@ def diagnose_logs(
             read_errors.append(f"{path}: {exc}")
             continue
         unparsed_total += unparsed
+        if not es and unparsed > 0:
+            format_mismatch.append(path)
         entries.extend(es)
 
     in_window = [e for e in entries if e.ts >= cutoff]
@@ -137,6 +142,7 @@ def diagnose_logs(
         "window": f"最近 {window.total_seconds() / 3600:.1f} 小时",
         "read_errors": read_errors,
         "unparsed_lines": unparsed_total,
+        "unparsed_files": format_mismatch,
         "total_parsed": len(entries),
         "error_fatal_in_window": len(error_lines),
         "category_counts": category_counts,
@@ -145,25 +151,29 @@ def diagnose_logs(
         "root_cause": {
             "determined": False,
             "note": (
-                "跨节点关联（confirmed/candidate/insufficient）只说明两侧日志是否属于同一执行上下文；"
-                "关联确认不等于故障根因已确认。根因需结合错误签名与验证步骤确认，本工具只提供证据，"
-                "不自动判定根因。"
+                "跨节点关联的置信度表示两侧日志是否属于同一执行上下文；"
+                "根因判定由错误签名匹配与验证步骤给出（见 diagnose 文本诊断输出）。"
             ),
         },
-        "conclusion": _conclusion(len(error_lines), category_counts, read_errors),
+        "conclusion": _conclusion(len(error_lines), category_counts, read_errors, format_mismatch),
     }
 
 
-def _conclusion(n_errors: int, cats: dict, read_errors: list) -> str:
+def _conclusion(n_errors: int, cats: dict, read_errors: list, format_mismatch: list) -> str:
     parts = []
     if read_errors:
         parts.append(f"{len(read_errors)} 个日志文件无法读取（证据不完整）：{'；'.join(read_errors)}")
+    if format_mismatch:
+        parts.append(
+            f"{len(format_mismatch)} 个日志文件全部行无法解析（格式与解析器不匹配，"
+            f"错误扫描与关联无证据）：{'；'.join(format_mismatch)}"
+        )
     if n_errors == 0:
-        parts.append("时间窗口内未发现 ERROR/FATAL 日志。注意：历史错误不等于当前故障，且日志缺失时无法据此断言健康。")
+        parts.append("时间窗口内未发现 ERROR/FATAL 日志。")
     else:
         parts.append(f"时间窗口内发现 {n_errors} 条 ERROR/FATAL 事件")
         if cats:
             parts.append("分类：" + "、".join(f"{k}×{v}" for k, v in sorted(cats.items(), key=lambda kv: -kv[1])))
-        parts.append("需结合发生时间与跨节点关联判断是否与当前故障相关。")
-    parts.append("跨节点关联（confirmed/candidate/insufficient）只说明两侧日志是否属于同一执行上下文，不等于故障根因已确认；根因结论须结合错误签名与验证步骤。")
+        parts.append("结合发生时间与跨节点关联判断与当前故障的相关性。")
+    parts.append("跨节点关联（confirmed/candidate/insufficient）表示两侧日志是否属于同一执行上下文；根因判定由错误签名匹配与验证步骤给出。")
     return "。".join(p.rstrip("。") for p in parts) + "。"

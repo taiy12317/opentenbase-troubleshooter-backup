@@ -1,4 +1,4 @@
-"""Codex 独立审查五问题的针对性回归测试。
+"""回归测试。
 
 覆盖：
   1. 关联查询时间窗口过滤（窗口过滤在关联前；两侧事件不同时在窗口内不得进入结果；
@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from otb_tools import diagnostics, inspector, preflight, rules
+from otb_tools import diagnostics, inspector, net, preflight, rules
 from otb_tools.models import Report, Status
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -230,7 +230,7 @@ class TestConninfoRebuildAndRedaction:
         ("postgresql://user@host/db?password=secret", ["secret"], "%2A%2A%2A"),
         ("postgresql://user:p%40ss@host:5432/db", ["p%40ss", "p@ss"], "***"),
     ])
-    def test_redact_conninfo_codex_cases(self, conninfo, secrets, marker):
+    def test_redact_conninfo_cases(self, conninfo, secrets, marker):
         from otb_tools.db import redact_conninfo
 
         out = redact_conninfo(conninfo)
@@ -241,16 +241,17 @@ class TestConninfoRebuildAndRedaction:
 
 # ---------------------------------------------------------------- 问题 3
 
-NODE_COLS = ["node_name", "node_type", "node_port", "node_host", "nodeis_primary"]
+NODE_COLS = ["oid", "node_name", "node_type", "node_port", "node_host", "nodeis_primary", "node_id"]
 
 
 def _mock_cluster(monkeypatch, tmp_path, nodes, values, fail_ports=(),
-                  run_sql_raise_ports=()):
+                  run_sql_raise_ports=(), raise_params=(), tcp_open=True):
     """构造 Mock 多主机集群：CN 192.0.2.10:15001，DN 注册 host 与 CN 不同。
 
     返回 (captured_conninfos, conns)。fake_run_sql 按查询文本分派；values
     为 {port: {param: value}}；fail_ports 中的端口 connect 抛 ConnectionError；
-    run_sql_raise_ports 中的端口在 current_setting('port') 时抛 RuntimeError。
+    run_sql_raise_ports 中的端口在 current_setting('port') 时抛 RuntimeError；
+    raise_params 中的参数在所有节点的 current_setting 查询抛 RuntimeError。
     """
     from psycopg2.extensions import parse_dsn
 
@@ -278,28 +279,30 @@ def _mock_cluster(monkeypatch, tmp_path, nodes, values, fail_ports=(),
         port = int(parse_dsn(conn.conninfo)["port"])
         if port in run_sql_raise_ports and "current_setting('port')" in sql:
             raise RuntimeError("simulated query failure")
+        if "current_setting" in sql:
+            p = sql.split("'")[1]
+            if p in raise_params:
+                raise RuntimeError(f"simulated param query failure: {p}")
+            if p == "port":
+                return [(str(port),)], ["current_setting"]
+            return [(values[port][p],)], ["current_setting"]
         if "FROM pgxc_node" in sql:
             return [tuple(n) for n in nodes], NODE_COLS
         if "FROM pgxc_group" in sql:
             return [("default_group", 0, 0)], ["group_name", "group_id", "group_members"]
-        if "current_setting" in sql:
-            if "port" in sql:
-                return [(str(port),)], ["current_setting"]
-            p = sql.split("'")[1]
-            return [(values[port][p],)], ["current_setting"]
         if "pg_stat_cluster_activity" in sql:
             return [], ["nodename", "state", "count"]
         if "pg_prepared_xacts" in sql:
             return [], ["gid", "prepared", "owner"]
         if "FROM pg_class" in sql and "pgxc_class" in sql:
             # data.skew 分布元数据：Mock 集群无用户表 → SKIP
-            return [], ["oid", "nspname", "relname", "reltuples", "pclocatortype", "discolnums"]
+            return [], ["oid", "nspname", "relname", "reltuples", "pclocatortype", "discolnums", "nodeoids"]
         raise AssertionError(f"unexpected sql: {sql}")
 
     monkeypatch.setattr(inspector, "connect", fake_connect)
     monkeypatch.setattr(inspector, "run_sql", fake_run_sql)
-    monkeypatch.setattr(inspector, "_ss_listening_ports",
-                        lambda: {15001, 15401, 15402, 5000})
+    monkeypatch.setattr(net, "ss_listening_ports", lambda: {15001, 15401, 15402, 5000})
+    monkeypatch.setattr(net, "tcp_port_open", lambda host, port, timeout=3.0: tcp_open)
     monkeypatch.setattr(
         inspector, "_run",
         lambda cmd, timeout=5: (
@@ -311,16 +314,19 @@ def _mock_cluster(monkeypatch, tmp_path, nodes, values, fail_ports=(),
 
 class TestDnRegisteredHost:
     NODES = [
-        ("cn0001", "C", 15001, "192.0.2.10", True),
-        ("dn0001", "D", 15401, "192.0.2.11", True),
-        ("dn0002", "D", 15402, "192.0.2.12", True),
+        (100, "cn0001", "C", 15001, "192.0.2.10", True, 0),
+        (101, "dn0001", "D", 15401, "192.0.2.11", True, 1),
+        (102, "dn0002", "D", 15402, "192.0.2.12", True, 2),
     ]
 
     def test_direct_dn_and_effective_use_registered_host(self, monkeypatch, tmp_path):
         from psycopg2.extensions import parse_dsn
 
-        values = {p: {"max_connections": "100", "shared_buffers": "128MB"} for p in
-                  (15001, 15401, 15402)}
+        values = {p: {
+            "max_connections": "100", "shared_buffers": "128MB",
+            "log_destination": "stderr", "logging_collector": "on",
+            "max_prepared_transactions": "10",
+        } for p in (15001, 15401, 15402)}
         captured, conns = _mock_cluster(monkeypatch, tmp_path, self.NODES, values)
         cfg = inspector.InspectorConfig(
             conninfo="host=192.0.2.10 port=15001 dbname=lab user=student password=stu",
@@ -329,7 +335,8 @@ class TestDnRegisteredHost:
         report = inspector.run(cfg)
         items = {i.id: i for i in report.items}
 
-        # 连接顺序：CN、dn1、dn2（直连）、CN、dn1、dn2（生效配置）
+        # 连接顺序：CN（巡检入口）、dn1、dn2（直连）、cn0001、dn1、dn2（生效配置，含 CN 自身）
+        assert len(captured) == 6
         cn_dsn = parse_dsn(captured[0])
         assert cn_dsn["host"] == "192.0.2.10" and cn_dsn["port"] == "15001"
         for idx, (host, port) in enumerate([("192.0.2.11", "15401"),
@@ -338,8 +345,12 @@ class TestDnRegisteredHost:
             assert dsn["host"] == host and dsn["port"] == port
             assert dsn["user"] == "student" and dsn["dbname"] == "lab"
             assert "192.0.2.10" not in captured[idx]  # 不得沿用 CN 的 host
-        for idx in (3, 4, 5):  # 生效配置采集同样使用注册 host
-            assert parse_dsn(captured[idx])["host"] in {"192.0.2.10", "192.0.2.11", "192.0.2.12"}
+        # 生效配置采集同样按注册地址：CN 连自身注册地址，DN 连各自注册 host
+        for idx, (host, port) in enumerate([("192.0.2.10", "15001"),
+                                            ("192.0.2.11", "15401"),
+                                            ("192.0.2.12", "15402")], start=3):
+            dsn = parse_dsn(captured[idx])
+            assert dsn["host"] == host and dsn["port"] == port
 
         direct = items["conn.direct_dn"]
         assert direct.status == Status.PASS
@@ -361,11 +372,11 @@ class TestDnRegisteredHost:
         direct = items["conn.direct_dn"]
         assert direct.status == Status.FAIL
         assert any("192.0.2.11:15401" in e and "直连失败" in e for e in direct.evidence)
-        # 直连失败如实报告；不因部分失败而把可达 DN 的报告降级为猜测
+        # 直连失败按实际结果报告；部分失败不影响可达 DN 的报告
         assert any("直连成功" in e for e in direct.evidence)
 
     def test_missing_port_node_reported_not_crash(self, monkeypatch, tmp_path):
-        nodes = self.NODES + [("dn0003", "D", None, "192.0.2.13", True)]
+        nodes = self.NODES + [(103, "dn0003", "D", None, "192.0.2.13", True, 3)]
         values = {p: {"max_connections": "100"} for p in (15001, 15401, 15402)}
         _mock_cluster(monkeypatch, tmp_path, nodes, values)
         cfg = inspector.InspectorConfig(
@@ -382,10 +393,120 @@ class TestDnRegisteredHost:
         assert cfg_item.status == Status.ERROR
         assert any("缺少端口" in e for e in cfg_item.evidence)
 
+    def test_gtm_node_skipped_in_effective_cfg(self, monkeypatch, tmp_path):
+        from psycopg2.extensions import parse_dsn
+
+        nodes = self.NODES + [(104, "gtm0001", "G", 5000, "192.0.2.50", True, 4)]
+        values = {p: {
+            "max_connections": "100", "shared_buffers": "128MB",
+            "log_destination": "stderr", "logging_collector": "on",
+            "max_prepared_transactions": "10",
+        } for p in (15001, 15401, 15402)}
+        captured, _ = _mock_cluster(monkeypatch, tmp_path, nodes, values)
+        cfg = inspector.InspectorConfig(
+            conninfo="host=192.0.2.10 port=15001 user=student",
+            log_dir=str(tmp_path), log_files={},
+        )
+        report = inspector.run(cfg)
+        cfg_item = next(i for i in report.items if i.id == "cfg.effective")
+        # GTM 为 GTM 协议节点，不得用 PG 协议连接采集配置（实测连接即被关闭）
+        assert all(parse_dsn(c)["port"] != "5000" for c in captured)
+        assert cfg_item.status == Status.PASS
+        assert any("GTM 协议节点" in f for f in cfg_item.facts)
+
+    def test_default_log_files_exclude_gtm(self):
+        cfg = inspector.InspectorConfig(conninfo="host=x port=1 user=u")
+        # GTM 日志非 PG stderr 格式（实测全部行无法解析），默认只扫 CN/DN
+        assert "gtm" not in cfg.log_files
+        assert set(cfg.log_files) == {"cn", "dn1", "dn2"}
+
 
 # ---------------------------------------------------------------- 问题 4
 
+class TestMultiCnAndParamFailures:
+    MULTI_CN = [
+        (100, "cn0001", "C", 15001, "192.0.2.10", True, 0),
+        (101, "cn0002", "C", 15002, "192.0.2.20", True, 1),
+        (102, "dn0001", "D", 15401, "192.0.2.11", True, 2),
+        (103, "dn0002", "D", 15402, "192.0.2.12", True, 3),
+    ]
+
+    @staticmethod
+    def _values(ports):
+        return {p: {
+            "max_connections": "100",
+            "shared_buffers": "128MB",
+            "log_destination": "stderr",
+            "logging_collector": "on",
+            "max_prepared_transactions": "10",
+        } for p in ports}
+
+    def test_multi_cn_effective_connects_each_registered_address(self, monkeypatch, tmp_path):
+        from psycopg2.extensions import parse_dsn
+
+        values = self._values((15001, 15002, 15401, 15402))
+        captured, _ = _mock_cluster(monkeypatch, tmp_path, self.MULTI_CN, values)
+        cfg = inspector.InspectorConfig(
+            conninfo="host=192.0.2.10 port=15001 dbname=lab user=student",
+            log_dir=str(tmp_path), log_files={},
+        )
+        report = inspector.run(cfg)
+        cn2 = [c for c in captured if parse_dsn(c)["port"] == "15002"]
+        assert cn2 and all(parse_dsn(c)["host"] == "192.0.2.20" for c in cn2)
+        assert any("cn0002" in e for e in next(i for i in report.items if i.id == "cfg.effective").evidence)
+        assert report.overall_exit_code() == 0
+
+    def test_param_level_failure_all_nodes_is_error_exit_2(self, monkeypatch, tmp_path):
+        values = self._values((15001, 15401, 15402))
+        _mock_cluster(monkeypatch, tmp_path, TestDnRegisteredHost.NODES, values,
+                      raise_params=("max_connections",))
+        cfg = inspector.InspectorConfig(
+            conninfo="host=192.0.2.10 port=15001 user=student",
+            log_dir=str(tmp_path), log_files={},
+        )
+        report = inspector.run(cfg)
+        cfg_item = next(i for i in report.items if i.id == "cfg.effective")
+        assert cfg_item.status == Status.ERROR  # 所有可达节点该参数均采集失败 → 证据不完整
+        assert "证据不完整" in cfg_item.summary
+        assert report.overall_exit_code() == 2
+
+    def test_watermark_without_data_skips(self, monkeypatch, tmp_path):
+        values = self._values((15001, 15401, 15402))
+        _mock_cluster(monkeypatch, tmp_path, TestDnRegisteredHost.NODES, values)
+        cfg = inspector.InspectorConfig(
+            conninfo="host=192.0.2.10 port=15001 user=student",
+            log_dir=str(tmp_path), log_files={},
+        )
+        report = inspector.run(cfg)
+        wm = next(i for i in report.items if i.id == "sessions.watermark")
+        assert wm.status == Status.SKIP  # 无会话计数数据时不推断水位
+        assert "未评估连接水位" in wm.summary
+
+    def test_tcp_unreachable_registered_port_fails(self, monkeypatch, tmp_path):
+        values = self._values((15001, 15401, 15402))
+        _mock_cluster(monkeypatch, tmp_path, TestDnRegisteredHost.NODES, values,
+                      tcp_open=False)
+        cfg = inspector.InspectorConfig(
+            conninfo="host=192.0.2.10 port=15001 user=student",
+            log_dir=str(tmp_path), log_files={},
+        )
+        report = inspector.run(cfg)
+        port_item = next(i for i in report.items if i.id == "pgxc.reg_vs_ports")
+        assert port_item.status == Status.FAIL
+        assert any("TCP 不可达" in e for e in port_item.evidence)
+        assert report.overall_exit_code() == 1
+
 class TestEffectiveConfigStatusPrecedence:
+    @staticmethod
+    def _values(ports):
+        return {p: {
+            "max_connections": "100",
+            "shared_buffers": "128MB",
+            "log_destination": "stderr",
+            "logging_collector": "on",
+            "max_prepared_transactions": "10",
+        } for p in ports}
+
     def _run(self, monkeypatch, tmp_path, values, fail_ports=()):
         nodes = TestDnRegisteredHost.NODES
         _mock_cluster(monkeypatch, tmp_path, nodes, values, fail_ports=fail_ports)
@@ -397,8 +518,8 @@ class TestEffectiveConfigStatusPrecedence:
 
     def test_collect_failure_kept_over_warn_diff(self, monkeypatch, tmp_path):
         # CN ok(100) / DN1 连接失败 / DN2 ok(80)：存在差异但采集不完整 → ERROR 优先
-        values = {15001: {"max_connections": "100"}, 15401: {"max_connections": "100"},
-                  15402: {"max_connections": "80"}}
+        values = self._values((15001, 15401, 15402))
+        values[15402]["max_connections"] = "80"
         report = self._run(monkeypatch, tmp_path, values, fail_ports=(15401,))
         cfg_item = next(i for i in report.items if i.id == "cfg.effective")
         assert cfg_item.status == Status.ERROR  # 旧实现被后续 WARN 覆盖
@@ -407,8 +528,9 @@ class TestEffectiveConfigStatusPrecedence:
         assert report.overall_exit_code() == 2  # ERROR 优先级最高
 
     def test_diff_all_collected_is_warn_exit_0(self, monkeypatch, tmp_path):
-        values = {15001: {"max_connections": "100"}, 15401: {"max_connections": "80"},
-                  15402: {"max_connections": "80"}}
+        values = self._values((15001, 15401, 15402))
+        values[15401]["max_connections"] = "80"
+        values[15402]["max_connections"] = "80"
         report = self._run(monkeypatch, tmp_path, values)
         cfg_item = next(i for i in report.items if i.id == "cfg.effective")
         assert cfg_item.status == Status.WARN
@@ -418,8 +540,7 @@ class TestEffectiveConfigStatusPrecedence:
 
     def test_query_failure_on_one_dn_direct_item_fail(self, monkeypatch, tmp_path):
         # 单节点查询异常：直连项如实 FAIL，配置项按已采集值继续，连接被关闭
-        values = {15001: {"max_connections": "100"}, 15401: {"max_connections": "100"},
-                  15402: {"max_connections": "100"}}
+        values = self._values((15001, 15401, 15402))
         captured, conns = _mock_cluster(monkeypatch, tmp_path, TestDnRegisteredHost.NODES,
                                         values, run_sql_raise_ports=(15401,))
         cfg = inspector.InspectorConfig(
@@ -497,7 +618,7 @@ class TestSqlstateRuleAttribution:
         d = diagnostics.diagnose_sqlstate("57P01")
         assert d["matched"] is True
         assert len(d["possible_causes"]) >= 2
-        assert "不是单一根因" in d["conclusion"]
+        assert "可由不同原因触发" in d["conclusion"]
         # 2026-11-23 ECS 实测升级：客户端 psql 捕获 FATAL (57P01)，管理员终止路径已复现
         assert d["confidence"] == "confirmed"
 

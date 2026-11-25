@@ -1,11 +1,9 @@
 """inspect 子命令：运行期集群巡检（只读）。
 
-原则：
-  - 节点连接失败只影响该节点相关检查，其余检查继续；
-  - 参数差异不等于配置错误（WARN 而非 FAIL）；
-  - 存在 prepared transaction 不等于事务异常（WARN 带说明）；
-  - 历史 ERROR/FATAL 不等于当前故障（标注时间与窗口）；
-  - 证据不足时明确说明，不编造根因。
+检查范围：CN 连接、pgxc_node/pgxc_group 注册、注册端口与实际监听/可达性、
+节点进程、CN→DN 直连、跨节点生效配置对比、会话与连接水位、残留 prepared
+事务、数据分布倾斜、日志错误扫描与 coord 跨节点关联。全部数据库查询走只读
+会话；节点连接失败只影响该节点相关检查，其余检查继续。
 """
 
 from __future__ import annotations
@@ -16,14 +14,14 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import timedelta
 
-from . import log_parser
+from . import log_parser, net
 from .db import connect, redact_conninfo, run_sql
 from .models import Correlation, Item, Report, Status
 
 # 不含用户名/密码的默认连接串：凭据必须由调用方通过 --conn 显式提供
 DEFAULT_CONNINFO = "host=127.0.0.1 port=15001"
 DEFAULT_LOG_DIR = "/data/opentenbase-lab/logs"
-DEFAULT_LOG_FILES = {"cn": "cn.log", "dn1": "dn1.log", "dn2": "dn2.log", "gtm": "gtm.log"}
+DEFAULT_LOG_FILES = {"cn": "cn.log", "dn1": "dn1.log", "dn2": "dn2.log"}
 COMPARABLE_PARAMS = ["max_connections", "shared_buffers", "log_destination", "logging_collector", "max_prepared_transactions"]
 SKEW_MAX_ROWS_DEFAULT = 100_000
 SKEW_FAIL_MIN_ROWS_DEFAULT = 10_000
@@ -104,18 +102,6 @@ def _run(cmd: list[str], timeout: int = 5) -> tuple[int, str, str]:
         return 124, "", f"command timed out after {timeout}s"
 
 
-def _ss_listening_ports() -> set[int]:
-    rc, out, err = _run(["ss", "-ltn"], timeout=5)
-    if rc != 0:
-        raise OSError(f"ss 不可用: {err or out}")
-    ports: set[int] = set()
-    for line in out.splitlines():
-        m = re.search(r":(\d+)\s", line)
-        if m:
-            ports.add(int(m.group(1)))
-    return ports
-
-
 def _db_error_item(name: str, exc: Exception) -> Item:
     item = Item(id=name, name=name, status=Status.ERROR)
     item.summary = str(exc)[:200]
@@ -125,7 +111,7 @@ def _db_error_item(name: str, exc: Exception) -> Item:
 def _query_nodes(conn) -> tuple[list[dict], str]:
     rows, cols = run_sql(
         conn,
-        "SELECT node_name, node_type, node_port, node_host, nodeis_primary, node_id "
+        "SELECT oid, node_name, node_type, node_port, node_host, nodeis_primary, node_id "
         "FROM pgxc_node ORDER BY node_id;",
     )
     nodes = []
@@ -154,7 +140,7 @@ def run(cfg: InspectorConfig, strict: bool = False) -> Report:
         conn_item.summary = f"连接失败: {str(exc)[:150]}"
         conn_item.source = [f"conninfo={redact_conninfo(cfg.conninfo)}"]
         conn_item.causes = ["CN 未运行或连接参数错误（含 user/password 未提供或错误）"]
-        conn_item.fix_hint = "用 --conn 提供完整连接串并核对 CN 端口监听；数据库不可用不影响端口/进程/日志检查"
+        conn_item.fix_hint = "用 --conn 提供完整连接串并核对 CN 端口监听；端口/进程/日志检查已独立执行"
         report.items.append(conn_item)
         _append_node_level_checks(report, cfg)
         _append_log_checks(report, cfg, [])
@@ -195,29 +181,41 @@ def run(cfg: InspectorConfig, strict: bool = False) -> Report:
         grp_item.summary = str(exc)[:200]
     report.items.append(grp_item)
 
-    # 注册信息 vs 实际监听
+    # 注册信息 vs 实际监听/可达性
     port_item = Item(id="pgxc.reg_vs_ports", name="注册信息与实际监听一致性", status=Status.PASS)
     try:
-        listening = _ss_listening_ports()
+        listening = net.ss_listening_ports()
         port_item.source = ["pgxc_node", "ss -ltn"]
+        local_checked = False
         for n in nodes:
             try:
                 port = int(n["node_port"])
             except (TypeError, ValueError):
                 port_item.status = Status.FAIL
-                port_item.evidence.append(f"{n['node_name']}: 注册端口无效（{n.get('node_port')!r}），无法核对监听")
+                port_item.evidence.append(f"{n['node_name']}: 注册端口无效（{n.get('node_port')!r}），无法核对")
                 continue
-            if port in listening:
-                port_item.evidence.append(f"{n['node_name']}: 端口 {port} 监听中")
+            host = (n.get("node_host") or "").strip()
+            if not host or net.is_local_host(host):
+                local_checked = True
+                if port in listening:
+                    port_item.evidence.append(f"{n['node_name']}: 本机端口 {port} 监听中")
+                else:
+                    port_item.status = Status.FAIL
+                    port_item.evidence.append(f"{n['node_name']}: 本机端口 {port} 未监听")
             else:
-                port_item.status = Status.FAIL
-                port_item.evidence.append(f"{n['node_name']}: 注册端口 {port} 未监听")
+                if net.tcp_port_open(host, port):
+                    port_item.evidence.append(f"{n['node_name']}: {host}:{port} TCP 可达")
+                else:
+                    port_item.status = Status.FAIL
+                    port_item.evidence.append(f"{n['node_name']}: {host}:{port} TCP 不可达")
+        if local_checked:
+            port_item.facts.append("本机监听表示端口被本机进程占用，进程归属由 node.processes 与 conn.direct_dn 核对")
         if port_item.status == Status.FAIL:
-            port_item.summary = "存在注册但未监听的节点（节点可能宕机）"
-            port_item.causes = ["节点进程未运行", "节点崩溃或未随集群启动"]
+            port_item.summary = "存在注册端口未监听或不可达的节点（节点可能宕机）"
+            port_item.causes = ["节点进程未运行", "节点崩溃或未随集群启动", "远程节点网络不可达"]
             port_item.fix_hint = "用 pg_ctl/gtm_ctl status 核对；检查 /data 下节点日志"
         else:
-            port_item.summary = "注册端口均处于监听状态"
+            port_item.summary = "注册端口均处于监听/可达状态"
     except OSError as exc:
         port_item.status = Status.ERROR
         port_item.summary = str(exc)
@@ -266,18 +264,22 @@ def run(cfg: InspectorConfig, strict: bool = False) -> Report:
     # 生效配置对比
     cfg_item = Item(id="cfg.effective", name="跨节点生效配置对比", status=Status.PASS)
     effective: dict[str, dict] = {}
+    perr: dict[str, list[str]] = {}
     targets = []
+    skipped_gtm = []
     for n in nodes:
-        if n["node_type"] == "C":
-            targets.append((n["node_name"], cfg.conninfo))
-        elif n["node_type"] == "D":
-            if n.get("node_port"):
-                targets.append((
-                    n["node_name"],
-                    _conninfo_for_node(cfg.conninfo, host=n.get("node_host") or "", port=int(n["node_port"])),
-                ))
-            else:
-                effective[n["node_name"]] = {"_error": "注册信息缺少端口，无法构造连接"}
+        if n["node_type"] not in ("C", "D"):
+            if n["node_type"] == "G":
+                skipped_gtm.append(n["node_name"])
+            continue
+        if n.get("node_port"):
+            # C/D 统一按注册 host/port 构造连接：多 CN 部署下每个 CN 连自己的注册地址
+            targets.append((
+                n["node_name"],
+                _conninfo_for_node(cfg.conninfo, host=n.get("node_host") or "", port=int(n["node_port"])),
+            ))
+        else:
+            effective[n["node_name"]] = {"_error": "注册信息缺少端口，无法构造连接"}
     seen_names = set()
     for name, conninfo in targets:
         if name in seen_names:
@@ -292,6 +294,7 @@ def run(cfg: InspectorConfig, strict: bool = False) -> Report:
                     vals[p] = rows[0][0]
                 except Exception:
                     vals[p] = None
+                    perr.setdefault(p, []).append(name)
             c.close()
             effective[name] = vals
         except Exception as exc:
@@ -301,29 +304,40 @@ def run(cfg: InspectorConfig, strict: bool = False) -> Report:
             cfg_item.evidence.append(f"{name}: 采集失败 {vals['_error']}")
         else:
             cfg_item.evidence.append(f"{name}: " + " ".join(f"{k}={v}" for k, v in vals.items() if v is not None))
-    # 状态聚合优先级：采集失败（ERROR）不被参数差异（WARN）覆盖；差异事实基于
-    # 采集成功的节点记录，并注明采集不完整。
+    collected = {n: v for n, v in effective.items() if "_error" not in v}
     diffs: list[tuple[str, list]] = []
     for param in COMPARABLE_PARAMS:
-        values = {v.get(param) for v in effective.values() if isinstance(v.get(param), str)}
+        values = {v.get(param) for v in collected.values() if isinstance(v.get(param), str)}
         if len(values) > 1:
             diffs.append((param, sorted(values)))
     errors = [name for name, vals in effective.items() if "_error" in vals]
+    if skipped_gtm:
+        cfg_item.facts.append(f"{'、'.join(skipped_gtm)} 为 GTM 协议节点，不参与配置对比")
+    total_fail = [
+        p for p in COMPARABLE_PARAMS
+        if perr.get(p) and not any(isinstance(v.get(p), str) for v in collected.values())
+    ]
     if diffs:
-        collected = len(effective) - len(errors)
         cfg_item.facts.append(f"参数 {', '.join(p for p, _ in diffs)} 在已采集节点间取值不同"
-                              + (f"（仅 {collected}/{len(effective)} 个节点采集成功，结论不完整）" if errors else ""))
-    if errors:
+                              + (f"（仅 {len(collected)}/{len(effective)} 个节点采集成功，统计基于该子集）" if errors else ""))
+    if not targets and not effective:
+        cfg_item.status = Status.SKIP
+        cfg_item.summary = "注册节点中无 C/D 节点可对比配置"
+    elif errors:
         cfg_item.status = Status.ERROR
         if len(errors) == len(effective) and effective:
             cfg_item.summary = "所有节点配置采集失败"
         else:
             cfg_item.summary = "部分节点配置采集失败（其余检查继续）"
-        cfg_item.causes = ["连接失败/权限不足/查询超时；采集失败不等于配置差异，二者分别记录"]
+        cfg_item.causes = ["连接失败/权限不足/查询超时；配置差异统计基于采集成功的节点"]
+    elif total_fail:
+        cfg_item.status = Status.ERROR
+        cfg_item.summary = f"参数 {', '.join(total_fail)} 在所有可达节点均采集失败（证据不完整）"
+        cfg_item.causes = ["权限不足", "参数在当前版本不存在（OpenTenBase 与 PG 的 GUC 差异）", "查询超时"]
     elif diffs:
         cfg_item.status = Status.WARN
         cfg_item.summary = "节点间存在参数差异"
-        cfg_item.causes = ["参数差异不一定表示配置错误（如 max_connections 可刻意不同），需结合部署意图判断"]
+        cfg_item.causes = ["参数差异可能来自部署意图（如各节点规格不同），结合部署配置判断是否需要统一"]
     else:
         cfg_item.summary = "对比参数取值一致"
     report.items.append(cfg_item)
@@ -357,30 +371,47 @@ def run(cfg: InspectorConfig, strict: bool = False) -> Report:
     # 连接水位
     wm_item = Item(id="sessions.watermark", name="连接水位", status=Status.PASS)
     try:
-        cn_name = next((n["node_name"] for n in nodes if n["node_type"] == "C"), "(cn)")
+        cn_names = [n["node_name"] for n in nodes if n["node_type"] == "C"]
+        cn_label = cn_names[0] if len(cn_names) == 1 else "(CN)"
         counts: dict[str, int] = {}
+        null_nodename = False
         rows, _ = run_sql(
             conn,
             "SELECT nodename, count(*) FROM pg_stat_cluster_activity "
             "WHERE backend_type = 'client backend' GROUP BY nodename;",
         )
         for r in rows:
-            counts[r[0] or cn_name] = r[1]
+            if r[0]:
+                counts[r[0]] = r[1]
+            else:
+                counts[cn_label] = counts.get(cn_label, 0) + r[1]
+                null_nodename = True
+        evaluated = 0
         for name, maxv in effective.items():
-            if isinstance(maxv.get("max_connections"), str):
-                cnt = counts.get(name)
-                if cnt is None:
-                    continue
-                ratio = cnt / int(maxv["max_connections"])
-                wm_item.evidence.append(f"{name}: {cnt}/{maxv['max_connections']} ({ratio:.0%})")
-                if ratio >= cfg.watermark_threshold:
-                    wm_item.status = Status.WARN
+            if not isinstance(maxv.get("max_connections"), str):
+                continue
+            cnt = counts.get(name)
+            if cnt is None:
+                continue
+            evaluated += 1
+            ratio = cnt / int(maxv["max_connections"])
+            wm_item.evidence.append(f"{name}: {cnt}/{maxv['max_connections']} ({ratio:.0%})")
+            if ratio >= cfg.watermark_threshold:
+                wm_item.status = Status.WARN
         if wm_item.status == Status.WARN:
             wm_item.summary = f"水位达到阈值 {cfg.watermark_threshold:.0%}"
             wm_item.causes = ["连接数接近上限，新连接可能被拒绝（53300）"]
             wm_item.fix_hint = "排查空闲连接与连接泄漏；如确认需要可评估调大 max_connections（需重启）"
+        elif evaluated == 0:
+            wm_item.status = Status.SKIP
+            wm_item.summary = "无 max_connections 数据可用，未评估连接水位"
+            wm_item.facts = ["水位依赖 cfg.effective 采集的 max_connections 与 pg_stat_cluster_activity 计数，数据缺失时不推断"]
+            if null_nodename:
+                wm_item.facts.append("部分会话记录 nodename 为空；多 CN 环境下无法归因到具体节点，未参与水位计算")
         else:
-            wm_item.summary = "水位正常"
+            wm_item.summary = f"水位正常（评估 {evaluated} 个节点）"
+            if null_nodename:
+                wm_item.facts.append("部分会话记录 nodename 为空；多 CN 环境下无法归因到具体节点，未参与水位计算")
     except Exception as exc:
         wm_item.status = Status.ERROR
         wm_item.summary = str(exc)[:200]
@@ -395,7 +426,7 @@ def run(cfg: InspectorConfig, strict: bool = False) -> Report:
         twopc_item.source = ["pg_prepared_xacts"]
         if rows:
             twopc_item.status = Status.WARN
-            twopc_item.facts = ["存在 prepared transaction 不等于事务异常，可能是正常两阶段提交"]
+            twopc_item.facts = ["prepared transaction 是两阶段提交的正常中间状态；异常残留常见于节点故障后未清理"]
             twopc_item.causes = ["正常 2PC 进行中", "异常残留（节点故障后未清理）"]
             twopc_item.fix_hint = "结合 prepared 时间与 pg_clean 机制判断是否需要清理（不自动清理）"
     except Exception as exc:
@@ -435,10 +466,10 @@ def _processes_item() -> Item:
     return item
 
 
-def _skew_stats_hint(conn, item: Item, qualified: str, oid, nsp: str, rel: str, pcattnum_text: str) -> None:
-    """零扫描倾斜风险提示（pg_stats）。仅作提示，不参与状态判定：统计信息≠实测倾斜。"""
+def _skew_stats_hint(conn, item: Item, qualified: str, oid, nsp: str, rel: str, discolnums_text: str) -> None:
+    """零扫描倾斜风险提示（pg_stats）。仅作提示，不参与状态判定：统计信息是估算值。"""
     attnums: list[int] = []
-    for tok in (pcattnum_text or "").split():
+    for tok in (discolnums_text or "").split():
         try:
             attnums.append(int(tok))
         except ValueError:
@@ -499,16 +530,17 @@ def _skew_stats_hint(conn, item: Item, qualified: str, oid, nsp: str, rel: str, 
 def _skew_item(conn, nodes: list[dict], cfg: InspectorConfig) -> Item:
     item = Item(id="data.skew", name="数据分布与倾斜检查", status=Status.PASS)
     item.source = ["pg_class", "pgxc_class", "pg_stats", "xc_node_id 分组行数"]
-    dn_count = len([n for n in nodes if n["node_type"] == "D"])
-    if dn_count <= 1:
+    dn_names = [n["node_name"] for n in nodes if n["node_type"] == "D"]
+    if len(dn_names) <= 1:
         item.status = Status.SKIP
-        item.summary = f"数据节点 {dn_count} 个，不存在跨节点倾斜概念"
+        item.summary = f"数据节点 {len(dn_names)} 个，不存在跨节点倾斜概念"
         return item
     id_to_name = {n.get("node_id"): n["node_name"] for n in nodes if n.get("node_id") is not None}
+    oid_to_name = {n.get("oid"): n["node_name"] for n in nodes if n.get("oid") is not None}
     try:
         rows, _ = run_sql(conn,
             "SELECT c.oid, n.nspname, c.relname, c.reltuples::bigint, "
-            "x.pclocatortype::text, x.discolnums::text "
+            "x.pclocatortype::text, x.discolnums::text, x.nodeoids::text "
             "FROM pg_class c "
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
             "LEFT JOIN pgxc_class x ON x.pcrelid = c.oid "
@@ -529,7 +561,7 @@ def _skew_item(conn, nodes: list[dict], cfg: InspectorConfig) -> Item:
     warn_tables: list[str] = []
     fail_tables: list[str] = []
     scan_errors: list[str] = []
-    for oid, nsp, rel, reltuples, locator, pcattnum in rows:
+    for oid, nsp, rel, reltuples, locator, discolnums_text, nodeoids_text in rows:
         qualified = f"{nsp}.{rel}"
         if not locator:
             item.evidence.append(f"{qualified}: 无 pgxc_class 分布信息（本地表/未分布式），跳过")
@@ -544,14 +576,14 @@ def _skew_item(conn, nodes: list[dict], cfg: InspectorConfig) -> Item:
             if reltuples is None or reltuples < 0:
                 item.evidence.append(
                     f"{qualified}: 未收集统计信息（reltuples={reltuples}），默认不精确扫描；可用 --skew-tables 显式指定")
-                _skew_stats_hint(conn, item, qualified, oid, nsp, rel, pcattnum)
+                _skew_stats_hint(conn, item, qualified, oid, nsp, rel, discolnums_text)
                 skipped += 1
                 continue
             if reltuples > cfg.skew_max_rows:
                 item.evidence.append(
                     f"{qualified}: reltuples={reltuples} 超过 --skew-max-rows={cfg.skew_max_rows}，"
-                    "默认不精确扫描（安全设计）；可用 --skew-tables 显式指定")
-                _skew_stats_hint(conn, item, qualified, oid, nsp, rel, pcattnum)
+                    "默认不精确扫描；可用 --skew-tables 显式指定")
+                _skew_stats_hint(conn, item, qualified, oid, nsp, rel, discolnums_text)
                 skipped += 1
                 continue
         try:
@@ -568,17 +600,44 @@ def _skew_item(conn, nodes: list[dict], cfg: InspectorConfig) -> Item:
             scanned += 1
             continue
         parts = [f"{id_to_name.get(rid, f'node_{rid}')}={cnt}" for rid, cnt in sorted(counts.items())]
-        missing = dn_count - len(counts)
+        unknown_ids = [rid for rid in counts if rid not in id_to_name]
+        if unknown_ids:
+            item.facts.append(f"{qualified}: 行数统计含未注册到 pgxc_node 的 xc_node_id {sorted(unknown_ids)}（分布元数据与注册信息不一致）")
+        # 期望节点范围：pgxc_class.nodeoids（表级分布节点）优先；为空时按集群 DN 数推断
+        expected_names = None
+        if nodeoids_text and oid_to_name:
+            oids = []
+            for tok in nodeoids_text.split():
+                try:
+                    oids.append(int(tok))
+                except ValueError:
+                    pass
+            if oids:
+                matched = [oid_to_name[o] for o in oids if o in oid_to_name]
+                if matched:
+                    expected_names = matched
+                if len(matched) != len(oids):
+                    item.facts.append(f"{qualified}: pgxc_class.nodeoids 含 {len(oids) - len(matched)} 个未匹配 pgxc_node.oid 的节点")
+        expected_count = len(expected_names) if expected_names is not None else len(dn_names)
+        missing = expected_count - len(counts)
         if missing > 0:
-            parts.append(f"其余 {missing} 个 DN=0 行")
+            if expected_names is not None:
+                counted_names = {id_to_name[rid] for rid in counts if rid in id_to_name}
+                zero_names = sorted(set(expected_names) - counted_names)
+                if zero_names:
+                    parts.append(f"{'、'.join(zero_names)}=0 行")
+                else:
+                    parts.append(f"其余 {missing} 个节点=0 行")
+            else:
+                parts.append(f"其余 {missing} 个 DN=0 行")
         maxv = max(counts.values())
-        minv = min(counts.values()) if missing == 0 else 0
+        minv = min(counts.values()) if missing <= 0 else 0
         ratio = maxv / minv if minv else float("inf")
         line = f"{qualified}: " + " ".join(parts) + f"（总计 {total}，最大/最小={ratio:.2f}）"
         if minv == 0:
             if total >= cfg.skew_fail_min_rows:
                 fail_tables.append(qualified)
-                line += " → 完全倾斜（存在 0 行 DN）"
+                line += " → 完全倾斜（存在 0 行节点）"
             else:
                 warn_tables.append(qualified)
                 line += " → 完全倾斜但总行数低于 FAIL 阈值，降级 WARN"
@@ -597,16 +656,17 @@ def _skew_item(conn, nodes: list[dict], cfg: InspectorConfig) -> Item:
     elif fail_tables:
         item.status = Status.FAIL
         item.summary = f"{len(fail_tables)} 张表完全倾斜：{', '.join(fail_tables)}"
-        item.causes = ["分布列取值高度集中（哈希分片后数据落在单一 DN）", "分布列选择不当或数据本身特征", "也可能是有意为之，需结合业务意图判断"]
-        item.fix_hint = "核对分布列（pgxc_class.pcattnum）；调整分布需重建表：CREATE TABLE ... DISTRIBUTE BY SHARD(列) 后迁移数据"
+        item.causes = ["分布列取值高度集中（哈希分片后数据落在单一节点）", "分布列选择不当或数据本身特征", "也可能是有意为之，需结合业务意图判断"]
+        item.fix_hint = "核对分布列（pgxc_class.discolnums）；调整分布需重建表：CREATE TABLE ... DISTRIBUTE BY SHARD(列) 后迁移数据"
     elif warn_tables:
         item.status = Status.WARN
         item.summary = f"{len(warn_tables)} 张表行数不均衡：{', '.join(warn_tables)}"
-        item.causes = ["分布列不同值数量少或取值偏斜", "不均衡不等于故障：不影响正确性，主要影响并行查询性能与节点负载"]
+        item.causes = ["分布列不同值数量少或取值偏斜", "行数不均衡影响并行查询性能与节点负载均衡，不影响查询正确性；结合业务数据特征评估分布列"]
         item.fix_hint = "结合业务评估分布列选择；调整需重建表（见 error-cases.md 数据倾斜条目）"
     elif scanned:
         item.summary = f"{scanned} 张分片表行数均衡" + (f"（{skipped} 张复制/本地/超阈值表跳过）" if skipped else "")
     else:
+        item.status = Status.SKIP
         item.summary = f"未精确统计任何分片表（{skipped} 张复制分布/无分布信息/超阈值）"
     if skipped:
         item.facts.append(f"{skipped} 张表未精确扫描（复制分布/无分布信息/规模阈值），不参与倾斜判定")
@@ -621,7 +681,7 @@ def _append_node_level_checks(report: Report, cfg: InspectorConfig) -> None:
     else:
         port_item.status = Status.PASS
         try:
-            listening = _ss_listening_ports()
+            listening = net.ss_listening_ports()
             port_item.source = ["ss -ltn"]
             for p in cfg.ports:
                 if p in listening:
@@ -631,6 +691,7 @@ def _append_node_level_checks(report: Report, cfg: InspectorConfig) -> None:
                     port_item.evidence.append(f"端口 {p}: 未监听")
             port_item.summary = ("存在未监听端口" if port_item.status == Status.FAIL
                                  else "提供的端口均处于监听状态")
+            port_item.facts = ["数据库不可用时按 --ports 做本机监听检查；远程节点可达性需数据库恢复后按注册信息核对"]
             if port_item.status == Status.FAIL:
                 port_item.causes = ["对应节点进程未运行"]
                 port_item.fix_hint = "用 pg_ctl/gtm_ctl status 核对；检查节点日志"
@@ -653,6 +714,7 @@ def _append_log_checks(report: Report, cfg: InspectorConfig, nodes: list[dict]) 
     entries: dict[str, list[log_parser.LogEntry]] = {}
     read_errors: list[str] = []
     unparsed_total = 0
+    format_mismatch: list[str] = []
     for node, fname in cfg.log_files.items():
         path = os.path.join(cfg.log_dir, fname) if not os.path.isabs(fname) else fname
         role = roles.get(node, "unknown")
@@ -663,18 +725,28 @@ def _append_log_checks(report: Report, cfg: InspectorConfig, nodes: list[dict]) 
             continue
         unparsed_total += unparsed
         entries[node] = es
+        if not es and unparsed > 0:
+            format_mismatch.append(f"{node}: {unparsed} 行全部无法解析")
         errors = [e for e in es if e.level in log_parser.ERROR_LEVELS and e.ts >= cutoff]
         if errors:
             scan_item.evidence.append(f"{node}: 窗口内 ERROR/FATAL {len(errors)} 条")
             for e in errors[:3]:
                 scan_item.evidence.append(f"  [{e.ts:%m-%d %H:%M:%S}] {e.level}: {e.message[:90]}")
         else:
-            scan_item.evidence.append(f"{node}: 窗口内无 ERROR/FATAL")
+            scan_item.evidence.append(f"{node}: 窗口内无 ERROR/FATAL" if es else f"{node}: 空日志文件")
     if read_errors:
         scan_item.status = Status.ERROR
         scan_item.summary = f"{len(read_errors)} 个日志不可读（证据不完整）"
         scan_item.evidence += read_errors
         scan_item.causes = ["日志文件权限不足（实验环境为 opentenbase:600），需以 root/属主运行"]
+    elif format_mismatch:
+        scan_item.status = Status.ERROR
+        scan_item.summary = f"{len(format_mismatch)} 个日志文件全部行无法解析（格式与解析器不匹配，错误扫描与关联无证据）"
+        scan_item.evidence += format_mismatch
+        scan_item.causes = [
+            "日志格式与默认 log_line_prefix 不一致（需 '2026-11-20 17:43:54.411 CST [pid,coord(p,v)] LEVEL: message' 形式）",
+            "文件非 stderr 文本日志（如 csvlog/二进制）",
+        ]
     else:
         total_err = sum(
             1 for es in entries.values() for e in es if e.level in log_parser.ERROR_LEVELS and e.ts >= cutoff
@@ -682,7 +754,7 @@ def _append_log_checks(report: Report, cfg: InspectorConfig, nodes: list[dict]) 
         scan_item.summary = f"窗口内 {total_err} 条 ERROR/FATAL"
         if total_err:
             scan_item.status = Status.WARN
-            scan_item.facts = ["历史/窗口内错误不等于当前故障，需结合发生时间与关联判断"]
+            scan_item.facts = ["窗口内错误已按时间列出；结合发生时间与关联判断与当前问题的相关性"]
     scan_item.source = [os.path.join(cfg.log_dir, f) if not os.path.isabs(f) else f for f in cfg.log_files.values()]
     scan_item.facts.append(f"未解析行共 {unparsed_total}（格式不符的非标准行）")
     report.items.append(scan_item)
@@ -712,12 +784,12 @@ def _append_log_checks(report: Report, cfg: InspectorConfig, nodes: list[dict]) 
     corr_item.evidence = [
         f"confirmed {len(confirmed)} / candidate {len([c for c in corr_in_window if c['confidence']=='candidate'])} / insufficient {len([c for c in corr_in_window if c['confidence']=='insufficient'])}"
     ]
-    corr_item.facts.append("关联置信度只说明两侧日志是否属同一执行上下文（关联可靠性），不等于故障根因已确认")
+    corr_item.facts.append("关联置信度表示两侧日志是否属于同一执行上下文；根因判定由错误签名匹配给出（见 diagnose）")
     if confirmed:
         corr_item.status = Status.FAIL
         corr_item.summary = f"{len(confirmed)} 条确认关联（CN/DN 双侧事件，属明确异常）"
         corr_item.causes = ["窗口内存在跨节点故障事件，详见 correlations 输出"]
-        corr_item.fix_hint = "结合确认关联的 coord 与错误文本签名（diagnose）进一步定位根因，勿把关联确认当作根因结论"
+        corr_item.fix_hint = "结合确认关联的 coord 与错误文本签名（diagnose）定位根因"
     else:
         corr_item.summary = "窗口内无确认关联事件"
     report.items.append(corr_item)

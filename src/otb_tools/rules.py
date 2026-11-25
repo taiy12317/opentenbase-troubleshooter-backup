@@ -1,10 +1,9 @@
 """诊断规则：已知失败签名匹配 + SQLSTATE 案例表。
 
-所有条目必须来自真实证据：
+所有条目均来自真实证据：
   - 本实验集群实测复现的（标注 reproduced）；
   - OpenTenBase 源码核验的（标注 source-verified）；
   - 社区 Issue/PR 记录的（标注 community-evidence，未经本环境复现）。
-禁止编造条目。
 """
 
 from __future__ import annotations
@@ -86,7 +85,7 @@ SIGNATURES: list[Signature] = [
         next_steps=[
             "核对用户实际连接的 host/port 与目标节点配置",
             "确认报错发生在客户端侧还是服务器侧",
-            "服务器侧 ss -ltn 核对监听；注意服务器本机 LISTEN 不等于客户端可达",
+            "服务器侧 ss -ltn 核对监听；服务器本机 LISTEN 与客户端可达是两件独立事实，须分别确认",
             "从实际客户端环境重试连接；核对节点状态（pg_ctl/gtm_ctl status）与启动日志",
         ],
         evidence="reproduced: 实验集群连不存在端口实测该错误（exit 2）；同一时刻集群其余端口正常",
@@ -98,15 +97,15 @@ SIGNATURES: list[Signature] = [
         severity="WARN",
         layer="generic",
         causes=[
-            "连接被拒绝：无法仅凭该文本判断节点宕机、端口配置错误或网络故障",
+            "连接被拒绝：需结合端口监听状态与实际连接串区分节点宕机、端口配置错误或网络故障",
             "常见可能：目标端口无监听、host/port 配置错误、网络/防火墙/转发不可达",
         ],
         next_steps=[
             "提供完整错误文本（含 psql 前缀）与实际连接串的 host/port",
-            "确认报错发生在客户端侧还是服务器侧；服务器 LISTEN 不等于客户端可达",
+            "确认报错发生在客户端侧还是服务器侧；服务器本机 LISTEN 与客户端可达须分别确认",
             "核对目标端口监听状态，并从实际客户端环境重试",
         ],
-        evidence="generic: 短文本仅能识别错误类别，不能定位根因",
+        evidence="generic: 短文本仅能识别错误类别，具体原因需补充完整错误文本与连接串信息",
     ),
     Signature(
         id="role-not-exists",

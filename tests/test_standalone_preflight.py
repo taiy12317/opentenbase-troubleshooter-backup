@@ -1,8 +1,7 @@
 """contrib-standalone/otb_preflight.py 的单测。
 
 standalone 版是零第三方依赖的单文件脚本，面向 OpenTenBase 主仓库 contrib/ 提交。
-测试仅用 pytest + monkeypatch，覆盖全部检查项、退出码语义与凭证脱敏（Codex 轮
-修复的密码泄漏点在此版同步锁定）。
+测试仅用 pytest + monkeypatch，覆盖全部检查项、退出码语义与凭证脱敏。
 """
 
 import os
@@ -172,6 +171,17 @@ class TestPorts:
     def test_ss_unavailable_errors(self, cfg, monkeypatch):
         monkeypatch.setattr(sf, "_ss_listening_ports", lambda: (_ for _ in ()).throw(OSError("ss 不可用: no ss")))
         assert sf.check_ports(cfg).status == sf.STATUS_ERROR
+
+    def test_ss_output_all_forms_parsed(self, monkeypatch):
+        # 回归：ss 输出存在仅绑定特定地址（含 IPv6 段）的监听行，须全部解析
+        out = (
+            "State      Recv-Q Send-Q Local Address:Port  Peer Address:Port\n"
+            "LISTEN     0      128    0.0.0.0:15001      0.0.0.0:*\n"
+            "LISTEN     0      128    [::]:5000          [::]:*\n"
+            "LISTEN     0      128    127.0.0.1:15401    0.0.0.0:*\n"
+        )
+        monkeypatch.setattr(sf, "_run", lambda cmd, timeout=5: (0, out, ""))
+        assert sf._ss_listening_ports() == {5000, 15001, 15401}
 
 
 class TestDirs:
@@ -387,6 +397,16 @@ class TestMainExitCodes:
     def test_arg_error_exit3(self, capsys):
         with pytest.raises(SystemExit) as exc:
             sf.main(["--no-such-option"])
+        assert exc.value.code == 3
+
+    def test_port_not_number_exit3(self):
+        with pytest.raises(SystemExit) as exc:
+            sf.main(["--ports", "abc"])
+        assert exc.value.code == 3
+
+    def test_port_out_of_range_exit3(self):
+        with pytest.raises(SystemExit) as exc:
+            sf.main(["--ports", "70000"])
         assert exc.value.code == 3
 
     def test_conn_redacted_in_header(self, cfg_with_tools, monkeypatch, capsys):

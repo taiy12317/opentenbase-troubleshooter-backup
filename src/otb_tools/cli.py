@@ -1,12 +1,11 @@
 """otb-tools CLI 入口。
 
-退出码语义（两种）：
-- preflight / inspect（健康检查类）：0 无 FAIL 级问题（WARN 允许；--strict 时 WARN 也计 1）
-  / 1 存在 FAIL / 2 执行失败或关键检查不完整 / 3 参数错误。
-- diagnose（离线诊断类）：0 诊断分析成功完成——无论是否命中历史错误事件，命中的是
-  历史事件不等于当前存在故障 / 2 分析未能完整执行（如输入文件读取失败）/ 3 参数错误。
-  --strict 为可选检测模式：识别到 FAIL/WARN 签名或 confirmed 关联时返回 1（检测到异常，
-  仍不等于确认当前故障）。历史 ERROR/FATAL 日志单独出现不判为故障，仅记录证据。
+退出码语义：
+  - preflight / inspect（健康检查类）：0 检查完成且无 FAIL（WARN 允许，--strict 时
+    WARN 计 1）/ 1 存在 FAIL / 2 存在 ERROR（关键检查未完成或证据不完整）/ 3 参数错误。
+  - diagnose（离线诊断类）：0 分析完成 / 2 证据不完整（输入文件读取失败或日志全部
+    行无法解析）/ 3 参数错误；--strict 为检测模式：识别到 FAIL/WARN 级签名或
+    confirmed 关联时返回 1（表示识别到异常事件，供脚本联动）。
 """
 
 from __future__ import annotations
@@ -21,9 +20,50 @@ from .models import Report
 
 def _parse_ports(s: str) -> list[int]:
     try:
-        return [int(p) for p in s.split(",") if p.strip()]
+        ports = [int(p) for p in s.split(",") if p.strip()]
     except ValueError:
         raise argparse.ArgumentTypeError(f"端口列表格式错误: {s}")
+    for p in ports:
+        if not 1 <= p <= 65535:
+            raise argparse.ArgumentTypeError(f"端口超出 1-65535 范围: {p}")
+    return ports
+
+
+def _positive_float(s: str) -> float:
+    try:
+        v = float(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"需要数字: {s!r}")
+    if not v > 0:
+        raise argparse.ArgumentTypeError(f"需要正数: {s!r}")
+    return v
+
+
+def _positive_int(s: str) -> int:
+    try:
+        v = int(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"需要整数: {s!r}")
+    if v <= 0:
+        raise argparse.ArgumentTypeError(f"需要正整数: {s!r}")
+    return v
+
+
+def _ratio(s: str) -> float:
+    v = _positive_float(s)
+    if v > 1:
+        raise argparse.ArgumentTypeError(f"需要在 0-1 之间: {s!r}")
+    return v
+
+
+def _non_negative_float(s: str) -> float:
+    try:
+        v = float(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"需要数字: {s!r}")
+    if v < 0:
+        raise argparse.ArgumentTypeError(f"需要非负数: {s!r}")
+    return v
 
 
 def _parse_env_overrides(s: str) -> dict:
@@ -61,7 +101,8 @@ def _add_common_output_args(p: argparse.ArgumentParser) -> None:
                    help="WARN 级检查项也计入退出码 1（默认只有 FAIL 级才非零）")
 
 
-def _emit(report: Report, fmt: str, output: str | None) -> None:
+def _emit(report: Report, fmt: str, output: str | None) -> bool:
+    """输出报告；写入文件失败时打印错误并返回 False（调用方返回退出码 2）。"""
     if fmt == "json":
         text = report.to_json()
     elif fmt == "markdown":
@@ -69,10 +110,15 @@ def _emit(report: Report, fmt: str, output: str | None) -> None:
     else:
         text = report.to_text()
     if output:
-        with open(output, "w", encoding="utf-8") as fh:
-            fh.write(text + "\n")
+        try:
+            with open(output, "w", encoding="utf-8") as fh:
+                fh.write(text + "\n")
+        except OSError as exc:
+            print(f"写入 {output} 失败: {exc}", file=sys.stderr)
+            return False
     else:
         print(text)
+    return True
 
 
 def _build_preflight_parser(sub: argparse._SubParsersAction) -> None:
@@ -90,8 +136,8 @@ def _build_preflight_parser(sub: argparse._SubParsersAction) -> None:
                    help="数据库应已在运行（端口未监听/连接拒绝视为 FAIL 而非预期）")
     p.add_argument("--probe-env", type=_parse_env_overrides, default={},
                    help="psql 探测时的环境变量覆盖（如 LD_LIBRARY_PATH=/wrong/path），用于复现依赖故障")
-    p.add_argument("--disk-min-free-gb", type=float, default=1.0)
-    p.add_argument("--timeout", type=int, default=10)
+    p.add_argument("--disk-min-free-gb", type=_non_negative_float, default=1.0)
+    p.add_argument("--timeout", type=_positive_int, default=10)
     _add_common_output_args(p)
 
 
@@ -112,7 +158,8 @@ def _cmd_preflight(args) -> int:
         timeout=args.timeout,
     )
     report = preflight.run(cfg, strict=args.strict)
-    _emit(report, args.format, args.output)
+    if not _emit(report, args.format, args.output):
+        return 2
     return report.overall_exit_code()
 
 
@@ -122,16 +169,16 @@ def _build_inspect_parser(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--ports", type=_parse_ports, default=[], help="数据库不可用时的备选端口列表")
     p.add_argument("--log-dir", default=inspector.DEFAULT_LOG_DIR)
     p.add_argument("--log-files", type=_parse_log_files, default={},
-                   help="node=文件名 映射，逗号分隔（默认 cn.log/dn1.log/dn2.log/gtm.log）")
-    p.add_argument("--log-window-hours", type=float, default=24.0)
-    p.add_argument("--watermark-threshold", type=float, default=0.8)
-    p.add_argument("--skew-max-rows", type=int, default=inspector.SKEW_MAX_ROWS_DEFAULT,
-                   help="reltuples 超过该值的表默认不做精确行数统计（安全设计）")
-    p.add_argument("--skew-fail-min-rows", type=int, default=inspector.SKEW_FAIL_MIN_ROWS_DEFAULT,
-                   help="完全倾斜（存在 0 行 DN）且总行数达到该值才判 FAIL，否则降级 WARN")
+                   help="node=文件名 映射，逗号分隔（默认 cn.log/dn1.log/dn2.log）")
+    p.add_argument("--log-window-hours", type=_positive_float, default=24.0)
+    p.add_argument("--watermark-threshold", type=_ratio, default=0.8)
+    p.add_argument("--skew-max-rows", type=_positive_int, default=inspector.SKEW_MAX_ROWS_DEFAULT,
+                   help="reltuples 超过该值的表默认不做精确行数统计")
+    p.add_argument("--skew-fail-min-rows", type=_positive_int, default=inspector.SKEW_FAIL_MIN_ROWS_DEFAULT,
+                   help="完全倾斜（存在 0 行节点）且总行数达到该值才判 FAIL，否则降级 WARN")
     p.add_argument("--skew-tables", default="",
                    help="逗号分隔的 schema.table 或 table，强制精确统计（覆盖规模阈值）")
-    p.add_argument("--timeout", type=int, default=5)
+    p.add_argument("--timeout", type=_positive_int, default=5)
     _add_common_output_args(p)
 
 
@@ -149,7 +196,8 @@ def _cmd_inspect(args) -> int:
         timeout=args.timeout,
     )
     report = inspector.run(cfg, strict=args.strict)
-    _emit(report, args.format, args.output)
+    if not _emit(report, args.format, args.output):
+        return 2
     return report.overall_exit_code()
 
 
@@ -163,9 +211,9 @@ def _build_diagnose_parser(sub: argparse._SubParsersAction) -> None:
                    help="日志文件，逗号分隔；node=path 形式显式标角色（cn*/dn* 参与关联），裸路径仅扫描错误不参与关联")
     p.add_argument("--cn-logs", help="CN 日志（逗号分隔，用于关联）")
     p.add_argument("--dn-logs", help="DN 日志（逗号分隔，用于关联）")
-    p.add_argument("--window-hours", type=float, default=24.0)
+    p.add_argument("--window-hours", type=_positive_float, default=24.0)
     p.add_argument("--strict", action="store_true",
-                   help="检测模式：识别到 FAIL/WARN 签名或 confirmed 关联时退出码 1（默认 0=分析完成；命中的历史事件不等于当前故障）")
+                   help="检测模式：识别到 FAIL/WARN 签名或 confirmed 关联时退出码 1（默认 0=分析完成）")
     p.add_argument("--format", choices=["json", "text"], default="text")
     p.add_argument("-o", "--output")
 
@@ -187,6 +235,8 @@ def _fmt_diagnosis(d: dict, fmt: str) -> str:
             lines.append(f"{k}: {d[k]}")
     if "errors" in d:
         lines.append(f"errors_in_window: {d['error_fatal_in_window']}  category_counts={d.get('category_counts')}")
+        if d.get("unparsed_files"):
+            lines.append(f"unparsed_files: {len(d['unparsed_files'])}")
         for e in d["errors"][:10]:
             lines.append(f"  [{e['time']}] {e['node']} {e['level']}: {e['message'][:100]}")
         lines.append(f"correlations: {len(d['correlations'])}")
@@ -217,8 +267,13 @@ def _classify_log_files(mapping: dict) -> tuple[list, list, list]:
 
 
 def _cmd_diagnose(args) -> int:
-    if not (args.sqlstate or args.text or args.text_file or args.log_files or args.cn_logs or args.dn_logs):
+    has_text = bool(args.sqlstate or args.text or args.text_file)
+    has_logs = bool(args.log_files or args.cn_logs or args.dn_logs)
+    if not has_text and not has_logs:
         print("需要 --sqlstate / --text / --text-file / --log-files / --cn-logs/--dn-logs 之一", file=sys.stderr)
+        return 3
+    if has_text and has_logs:
+        print("--sqlstate/--text/--text-file 与 --log-files/--cn-logs/--dn-logs 不能同时使用", file=sys.stderr)
         return 3
     if args.sqlstate:
         d = diagnostics.diagnose_sqlstate(args.sqlstate)
@@ -249,15 +304,19 @@ def _cmd_diagnose(args) -> int:
         )
     text = _fmt_diagnosis(d, args.format)
     if args.output:
-        with open(args.output, "w", encoding="utf-8") as fh:
-            fh.write(text + "\n")
+        try:
+            with open(args.output, "w", encoding="utf-8") as fh:
+                fh.write(text + "\n")
+        except OSError as exc:
+            print(f"写入 {args.output} 失败: {exc}", file=sys.stderr)
+            return 2
     else:
         print(text)
-    if d.get("read_errors"):
+    if d.get("read_errors") or d.get("unparsed_files"):
         return 2
     if args.strict:
         # 检测模式：签名命中（FAIL/WARN）或 confirmed 关联 → 1。
-        # 仅表示识别到异常事件/双侧日志属于同一执行上下文，不等于当前故障或根因确认。
+        # 表示识别到异常事件，或双侧日志属于同一执行上下文。
         sevs = [d.get("severity")] + [m.get("severity") for m in d.get("matches", [])]
         if any(s in ("FAIL", "WARN") for s in sevs if s):
             return 1

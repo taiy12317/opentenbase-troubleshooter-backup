@@ -20,7 +20,7 @@ cd <toolkit 仓库根目录>
 PYTHONPATH=src python3 -m otb_tools.cli preflight [选项]
 ```
 
-实验 ECS 上的执行方式（集群在本机，工具装在服务器上；workbench 为课程环境专用，其他环境忽略本段）：
+实验 ECS 上的执行方式（workbench 为课程环境专用，其他环境忽略本段）：
 
 ```bash
 workbench exec -i <实例ID> -r cn-beijing --timeout 120 -c \
@@ -41,25 +41,36 @@ workbench exec -i <实例ID> -r cn-beijing --timeout 120 -c \
 | `--pg-bin` | 二进制目录（默认 /opt/opentenbase-lab/pg/bin） |
 | `--runtime-libpq` | runtime libpq 目录（默认 /opt/opentenbase-lab/runtime/libpq） |
 | `--data-dirs` / `--log-dir` / `--ports` | 逗号分隔覆盖默认值 |
+| `--compat-dirs` / `--disk-min-free-gb` | 覆盖动态库兼容目录（默认 /opt/opentenbase-lab/compat/{usr/,}lib/x86_64-linux-gnu）与磁盘最小可用空间阈值（默认 1.0GB） |
 | `--conf-files` / `--pg-hba-files` | 逗号分隔配置文件路径（提供后检查重复参数/trust） |
 | `--conn "host=... "` | 提供后追加部署后验证（仅连接探测）；运行期巡检（节点组/2PC/水位/日志关联）由 inspect 负责 |
 | `--expect-running` | 数据库应已运行：端口未监听、连接拒绝判 FAIL；默认视为部署前（未运行属预期） |
 | `--probe-env "LD_LIBRARY_PATH=/wrong/path"` | 用错误环境复现动态库故障（不改真实环境，只影响 psql 子进程） |
+| `--timeout` / `--output` | 子进程超时秒数（默认 10）/ 报告输出到文件 |
 | `--strict` | WARN 也计入退出码 1 |
 | `--format json\|text\|markdown` | 输出格式 |
 
+## 排查工作流
+
+按用户报告组织输出：异常现象 → 工具证据 → 可能原因 → 修复步骤。
+
+1. 先跑完整 `preflight`（必要时 `--format json`），按 status 分级处理：
+   - FAIL：给出对应 fix_hint，必要时用 `--probe-env` 或干净 shell 复现确认（如动态库缺失）；
+   - WARN：说明影响与触发条件（如 trust 认证、端口占用）；
+   - SKIP：说明未检查的原因（未提供路径/连接串），需要时补参数重跑。
+2. 依据 facts（已确认事实）与 possible_causes（可能原因）组织结论；工具未确认的内容标注为假设并给出验证方法。
+3. 启动失败类报告：exit 127 按三种成因区分（动态库缺失 / psql 不在 PATH / 依赖无法解析），证据为子进程退出码与错误文本；Connection refused 按 `--expect-running` 语义解读。
+4. 需要运行期证据（节点组/2PC/水位/日志关联）时改用 otb-cluster-inspector。
+
 ## 结果解读
 
-每个检查项含：`status`（PASS/WARN/FAIL/ERROR/SKIP）、`evidence`（原始证据，含子进程退出码）、`possible_causes`、`hypotheses`、`fix_hint`。
-
-- 子进程退出码 127 可能是动态库缺失（LD_LIBRARY_PATH 不完整）或 psql 不在 PATH，工具按错误文本区分（`[Errno 2]` 且含 'psql' 为后者），2 = 连接失败，均只作为证据记录，不透传为工具退出码。
+- 每个检查项含：`status`（PASS/WARN/FAIL/ERROR/SKIP）、`evidence`（原始证据，含子进程退出码）、`facts`（已确认事实）、`possible_causes`、`hypotheses`（待验证假设）、`fix_hint`。
 - 工具退出码：0 无 FAIL 级问题（WARN 允许）/ 1 存在 FAIL（--strict 下 WARN 也计 1）/ 2 执行失败或关键检查不完整 / 3 参数错误。JSON 输出含 `execution_status`（工具是否执行完成）与 `health_status`（环境是否就绪），两者含义不同。
+- 子进程退出码（127 = 动态库缺失或 psql 不在 PATH、2 = 连接失败）只作为 evidence 记录，不透传为工具退出码。
 - `auth.pg_hba_trust` 为 WARN 表示存在 trust 规则（密码校验未生效），实验室单机可接受，生产需评估。
 - 检查项 SKIP 表示条件不满足（如未提供配置文件路径），不是故障。
 
 ## 约束
 
 - 只读：不修改配置、不创建目录、不装依赖、不启停节点。
-- 不把可选配置差异报为错误；参数差异用 WARN 并说明。
-- 证据不足时如实说明，不编造原因。
-- 错误签名知识库见仓库 `references/error-cases.md`（libreadline/libssl/libpq 缺失、Connection refused、28000/3D000、PGXC Group 未定义等，均来自真实复现）。
+- 故障知识库见仓库 `references/error-cases.md`（libreadline/libssl/libpq 缺失、Connection refused、28000/3D000、PGXC Group 未定义等，均来自真实复现）。

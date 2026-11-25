@@ -93,7 +93,7 @@ file for `contrib/` submission:
 
 ## Tests
 
-`tests/test_standalone_preflight.py` (pytest): 56 tests covering every check,
+`tests/test_standalone_preflight.py` (pytest): 59 tests covering every check,
 exit codes 0/1/2/3, conninfo redaction for quoted/URI forms, probe-env password
 redaction, and the exit-127 disambiguation (missing shared libraries vs psql
 not in PATH).

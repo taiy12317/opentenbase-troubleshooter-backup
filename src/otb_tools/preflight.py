@@ -16,7 +16,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 
-from . import rules
+from . import net, rules
 from .models import Item, Report, Status
 from .db import redact_conninfo
 
@@ -66,19 +66,6 @@ def _run(cmd: list[str], env: dict | None = None, timeout: int = 10) -> tuple[in
 
 def _attached_signatures(text: str) -> list[dict]:
     return rules.match_signatures(text)
-
-
-def _ss_listening_ports() -> set[int]:
-    """解析 `ss -ltn` 输出中的监听端口。ss 不存在时抛 OSError。"""
-    rc, out, err = _run(["ss", "-ltn"], timeout=5)
-    if rc != 0:
-        raise OSError(f"ss 不可用: {err or out}")
-    ports: set[int] = set()
-    for line in out.splitlines():
-        m = re.search(r":(\d+)\s+0\.0\.0\.0", line) or re.search(r":(\d+)\s+\[::\]", line)
-        if m:
-            ports.add(int(m.group(1)))
-    return ports
 
 
 def _check_env_ld_library_path(cfg: PreflightConfig) -> Item:
@@ -167,7 +154,7 @@ def _check_libpq_symlink(cfg: PreflightConfig) -> Item:
 def _check_ports(cfg: PreflightConfig) -> Item:
     item = Item(id="port.check", name="端口占用检查", status=Status.PASS)
     try:
-        listening = _ss_listening_ports()
+        listening = net.ss_listening_ports()
     except OSError as exc:
         item.status = Status.ERROR
         item.summary = str(exc)
@@ -346,13 +333,17 @@ def _check_db_probe(cfg: PreflightConfig) -> Item:
     item.facts = ["提供 --conn 即进入部署后验证模式，仅做连接探测；运行期巡检（节点组/2PC/会话水位/日志关联）由 inspect 负责"]
     env = dict(os.environ)
     env.update(cfg.probe_env)
+    # 优先使用 --pg-bin 下的 psql（与部署一致），不存在时回退 PATH
+    psql_bin = os.path.join(cfg.pg_bin, "psql") if os.path.isfile(os.path.join(cfg.pg_bin, "psql")) else "psql"
     rc, out, err = _run(
-        ["psql", cfg.conninfo, "-X", "-v", "ON_ERROR_STOP=1", "-Atc", "SELECT 1;"],
+        [psql_bin, cfg.conninfo, "-X", "-v", "ON_ERROR_STOP=1", "-Atc", "SELECT 1;"],
         env=env,
         timeout=cfg.timeout,
     )
-    item.source = [f"psql {redact_conninfo(cfg.conninfo)}"]
+    item.source = [f"{psql_bin} {redact_conninfo(cfg.conninfo)}"]
     item.evidence = [f"exit_code={rc}"] + ([err[:300]] if err else [])
+    if psql_bin != "psql":
+        item.evidence.append(f"psql 路径: {psql_bin}（--pg-bin）")
     if cfg.probe_env:
         # probe_env 可能包含密码类变量（如 PGPASSWORD），显示时脱敏
         shown_env = {

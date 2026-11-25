@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-from otb_tools import diagnostics, preflight
+from otb_tools import diagnostics, net, preflight
 from otb_tools.models import Report, Status
 from otb_tools.rules import SQLSTATE_TABLE, match_signatures
 
@@ -59,12 +59,12 @@ class TestDiagnose:
         assert any("PGXC" in c for c in d["possible_causes"])
         # 只有 SQLSTATE 时必须表达不确定性
         assert "错误类别" in d["conclusion"]
-        assert "单一根因" in d["conclusion"] or "不同原因" in d["conclusion"]
+        assert "不同原因" in d["conclusion"]
 
     def test_sqlstate_unknown_honest(self):
         d = diagnostics.diagnose_sqlstate("0A999")
         assert d["matched"] is False
-        assert "无法确定根因" in d["conclusion"]
+        assert "不在当前案例库中" in d["conclusion"]
 
     def test_text_known(self):
         d = diagnostics.diagnose_text("error while loading shared libraries: libssl.so.1.1: cannot open shared object file")
@@ -90,7 +90,7 @@ class TestDiagnose:
         assert d["matched"] is True
         assert d["confidence"] == "candidate"
         assert d["matches"][0]["id"] == "connection-refused-generic"
-        assert any("无法仅凭该文本判断" in c for c in d["matches"][0]["possible_causes"])
+        assert any("需结合端口监听状态与实际连接串区分" in c for c in d["matches"][0]["possible_causes"])
 
     def test_text_type_not_exists_causes_cover_search_path(self):
         d = diagnostics.diagnose_text('ERROR:  (42704) type "memories" does not exist')
@@ -113,9 +113,9 @@ class TestDiagnose:
         assert "node_state" in d["category_counts"] or "distribution" in d["category_counts"]
         confirmed = [c for c in d["correlations"] if c["confidence"] == "confirmed"]
         assert any(c["coord"] == "2533,76" for c in confirmed)
-        # 关联确认不等于根因确认：结果模型必须显式区分
+        # 关联置信度回答"两侧是否同属执行上下文"；根因判定由错误签名匹配给出
         assert d["root_cause"]["determined"] is False
-        assert "不等于故障根因已确认" in d["root_cause"]["note"]
+        assert "根因判定由错误签名匹配" in d["root_cause"]["note"]
 
     def test_diagnose_logs_missing_files(self):
         from datetime import timedelta
@@ -127,6 +127,32 @@ class TestDiagnose:
         )
         assert len(d["read_errors"]) == 1
         assert "证据不完整" in d["conclusion"]
+
+    def test_diagnose_logs_all_unparsable_reports_format_mismatch(self, tmp_path):
+        from datetime import timedelta
+
+        path = tmp_path / "garbage.log"
+        path.write_text("not a log line\nanother garbage line\n")
+        d = diagnostics.diagnose_logs(
+            cn_paths=[str(path)],
+            dn_paths=[],
+            window=timedelta(days=1),
+        )
+        assert d["unparsed_files"] == [str(path)]
+        assert "格式与解析器不匹配" in d["conclusion"]
+
+    def test_diagnose_logs_blank_only_file_not_mismatch(self, tmp_path):
+        from datetime import timedelta
+
+        path = tmp_path / "blank.log"
+        path.write_text("\n\n\n")
+        d = diagnostics.diagnose_logs(
+            cn_paths=[str(path)],
+            dn_paths=[],
+            window=timedelta(days=1),
+        )
+        assert d["unparsed_files"] == []
+        assert d["unparsed_lines"] == 0
 
     def test_correlation_truncation_keeps_confirmed(self, tmp_path):
         from datetime import datetime, timedelta, timezone
@@ -178,7 +204,7 @@ class TestPreflightUnit:
             with open(p, "w") as fh:
                 fh.write("#!/bin/sh\n")
             os.chmod(p, 0o755)
-        monkeypatch.setattr(preflight, "_ss_listening_ports", lambda: {15401})
+        monkeypatch.setattr(net, "ss_listening_ports", lambda: {15401})
         return cfg
 
     def test_env_var_missing_warns(self, tmp_path, monkeypatch):
@@ -236,7 +262,7 @@ class TestPreflightUnit:
         from otb_tools.preflight import _check_ports
 
         cfg = self._cfg(tmp_path, monkeypatch)
-        monkeypatch.setattr(preflight, "_ss_listening_ports", lambda: set())
+        monkeypatch.setattr(net, "ss_listening_ports", lambda: set())
         item = _check_ports(cfg)  # expect_running=False
         assert item.status == Status.PASS  # 端口空闲可部署
         cfg.expect_running = True
@@ -346,3 +372,37 @@ class TestPreflightUnit:
         item = _check_db_probe(cfg)
         assert "secret" not in item.source[0]
         assert "***" in item.source[0]
+
+    def test_db_probe_prefers_pg_bin_psql(self, tmp_path, monkeypatch):
+        from otb_tools.preflight import _check_db_probe
+
+        captured = {}
+        cfg = self._cfg(tmp_path, monkeypatch)
+        cfg.conninfo = "host=127.0.0.1 port=15001 user=student"
+
+        def fake_run(cmd, env=None, timeout=10):
+            captured["cmd"] = cmd
+            return (0, "1", "")
+
+        monkeypatch.setattr(preflight, "_run", fake_run)
+        item = _check_db_probe(cfg)
+        assert item.status == Status.PASS
+        assert captured["cmd"][0] == os.path.join(cfg.pg_bin, "psql")
+        assert item.source[0].startswith(os.path.join(cfg.pg_bin, "psql"))
+
+    def test_db_probe_falls_back_to_path_psql(self, tmp_path, monkeypatch):
+        from otb_tools.preflight import _check_db_probe
+
+        captured = {}
+        cfg = self._cfg(tmp_path, monkeypatch)
+        os.remove(os.path.join(cfg.pg_bin, "psql"))
+        cfg.conninfo = "host=127.0.0.1 port=15001"
+
+        def fake_run(cmd, env=None, timeout=10):
+            captured["cmd"] = cmd
+            return (2, "", "psql: could not connect to server: Connection refused")
+
+        monkeypatch.setattr(preflight, "_run", fake_run)
+        item = _check_db_probe(cfg)
+        assert item.status == Status.WARN
+        assert captured["cmd"][0] == "psql"

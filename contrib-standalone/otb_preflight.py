@@ -147,8 +147,7 @@ def _ss_listening_ports():
         raise OSError(f"ss 不可用: {err or out}")
     ports = set()
     for line in out.splitlines():
-        m = re.search(r":(\d+)\s+0\.0\.0\.0", line) or re.search(r":(\d+)\s+\[::\]", line)
-        if m:
+        for m in re.finditer(r":(\d+)\s", line):
             ports.add(int(m.group(1)))
     return ports
 
@@ -415,12 +414,15 @@ def check_db_probe(args):
     for kv in args.probe_env or []:
         k, _, v = kv.partition("=")
         env[k] = v
+    psql_bin = os.path.join(args.pg_bin, "psql") if os.path.isfile(os.path.join(args.pg_bin, "psql")) else "psql"
     rc, out, err = _run(
-        ["psql", args.conn, "-X", "-v", "ON_ERROR_STOP=1", "-Atc", "SELECT 1;"],
+        [psql_bin, args.conn, "-X", "-v", "ON_ERROR_STOP=1", "-Atc", "SELECT 1;"],
         env=env,
         timeout=args.timeout,
     )
     item.evidence = [f"exit_code={rc}"] + ([err[:300]] if err else [])
+    if psql_bin != "psql":
+        item.evidence.insert(1, f"psql 路径: {psql_bin}（--pg-bin）")
     if args.probe_env:
         shown = []
         for kv in args.probe_env:
@@ -496,7 +498,16 @@ def main(argv=None):
 
     args.compat_dirs = [d for d in args.compat_dirs.split(",") if d]
     args.data_dirs = [d for d in args.data_dirs.split(",") if d]
-    args.ports = [int(p) for p in args.ports.split(",") if p]
+    try:
+        ports = [int(p) for p in args.ports.split(",") if p]
+    except ValueError:
+        print(f"otb_preflight.py: error: 端口参数格式错误（需为整数，逗号分隔）: {args.ports}", file=sys.stderr)
+        sys.exit(3)
+    for p in ports:
+        if not 1 <= p <= 65535:
+            print(f"otb_preflight.py: error: 端口超出 1-65535 范围: {p}", file=sys.stderr)
+            sys.exit(3)
+    args.ports = ports
     args.conf_files = [p for p in args.conf_files.split(",") if p]
     args.pg_hba_files = [p for p in args.pg_hba_files.split(",") if p]
 

@@ -123,11 +123,13 @@ def parse_line(line: str, node: str = "", source: str = "", lineno: int = 0) -> 
 
 
 def parse_file(path: str, node: str = "") -> tuple[list[LogEntry], int]:
-    """返回 (解析出的条目, 未解析行数)。文件缺失/不可读抛 OSError。"""
+    """返回 (解析出的条目, 未解析行数)。空行不计入未解析。文件缺失/不可读抛 OSError。"""
     entries: list[LogEntry] = []
     unparsed = 0
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         for lineno, line in enumerate(fh, 1):
+            if not line.strip():
+                continue
             e = parse_line(line, node=node, source=path, lineno=lineno)
             if e is None:
                 unparsed += 1
@@ -230,7 +232,7 @@ def correlate(
             event_time = max([c.ts, *(d.ts for d in matched_dns)])
             results.append(make_result(
                 key, c, matched_dns, "confirmed",
-                "CN 同 coord 记录与时间窗口内的 DN WARNING 及以上事件配对；只确认上下文关联，不确认因果或根因",
+                "CN 与 DN 同 coord 事件在配对窗口内命中（DN 侧含 WARNING 及以上事件），两侧属于同一执行上下文",
                 event_time, len(matched_dns),
             ))
         elif low_level_pair:
@@ -238,7 +240,7 @@ def correlate(
             event_time = max([c.ts, *(d.ts for d in matched_dns)])
             results.append(make_result(
                 key, c, matched_dns, "candidate",
-                "两侧存在窗口内的同 coord 事件，但 DN 侧级别不足以确认异常关联",
+                "两侧存在窗口内的同 coord 事件（DN 侧均为 LOG 级）",
                 event_time, len(matched_dns),
             ))
         else:
