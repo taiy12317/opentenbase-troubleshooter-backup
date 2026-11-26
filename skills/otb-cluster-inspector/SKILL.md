@@ -13,7 +13,13 @@ description: OpenTenBase 集群运行状态巡检与故障诊断。当用户要�
 
 ## 前置条件
 
-CLI 位于 OpenTenBase Agentic Troubleshooting Toolkit 仓库（`src/otb_tools/`）。数据库查询需 psycopg2（`pip install 'otb-troubleshooting-toolkit[db]'`）；日志扫描与 diagnose 不需要。连接凭据一律通过 `--conn` 显式提供。
+CLI 位于 OpenTenBase Agentic Troubleshooting Toolkit 仓库（`src/otb_tools/`）。从源码仓库根目录安装 CLI 与可选依赖：
+
+```bash
+python3 -m pip install -e '.[db,test]'
+```
+
+`db` 安装 `inspect` 所需的 psycopg2，`test` 安装 pytest；日志扫描与 `diagnose` 不需要 psycopg2。连接凭据一律通过 `--conn` 显式提供。
 
 ```bash
 cd <toolkit 仓库根目录>

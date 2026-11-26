@@ -19,7 +19,7 @@ Python ≥ 3.9（开发验证于 3.10.12 / 3.14.7）。
 ```bash
 git clone https://github.com/taiy12317/opentenbase-troubleshooter.git
 cd opentenbase-troubleshooter
-pip install -e '.[db,test]'         # db=psycopg2（inspect 需要）；test=pytest（跑测试）
+python3 -m pip install -e '.[db,test]'  # db=psycopg2（inspect 需要）；test=pytest（跑测试）
 ```
 
 不经安装也可直接运行：
