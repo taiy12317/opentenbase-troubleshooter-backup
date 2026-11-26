@@ -1,7 +1,27 @@
-input: psql: could not connect to server: Connection refused
-matched: True
-confidence: confirmed
-- signature: connection-refused (connectivity, FAIL)
-  causes: 客户端到目标 host/port 的连接被拒绝：目标端口无进程监听（节点未启动/已崩溃）；连接了错误的 host/port（连接串与实际部署不一致）；网络路径问题（防火墙/容器网络/隧道未建立）
-  next: 核对用户实际连接的 host/port 与目标节点配置；确认报错发生在客户端侧还是服务器侧；服务器侧 ss -ltn 核对监听；注意服务器本机 LISTEN 不等于客户端可达；从实际客户端环境重试连接；核对节点状态（pg_ctl/gtm_ctl status）与启动日志
-conclusion: connection-refused
+{
+  "input": "psql: could not connect to server: Connection refused",
+  "matched": true,
+  "matches": [
+    {
+      "id": "connection-refused",
+      "category": "connectivity",
+      "severity": "FAIL",
+      "possible_causes": [
+        "客户端到目标 host/port 的连接被拒绝：目标端口无进程监听（节点未启动/已崩溃）",
+        "连接了错误的 host/port（连接串与实际部署不一致）",
+        "网络路径问题（防火墙/容器网络/隧道未建立）"
+      ],
+      "next_steps": [
+        "核对用户实际连接的 host/port 与目标节点配置",
+        "确认报错发生在客户端侧还是服务器侧",
+        "服务器侧 ss -ltn 核对监听；服务器本机 LISTEN 与客户端可达是两件独立事实，须分别确认",
+        "从实际客户端环境重试连接；核对节点状态（pg_ctl/gtm_ctl status）与启动日志"
+      ],
+      "evidence_basis": "reproduced: 实验集群连不存在端口实测该错误（exit 2）；同一时刻集群其余端口正常",
+      "layer": "specific",
+      "matched_fields": {}
+    }
+  ],
+  "confidence": "confirmed",
+  "conclusion": "connection-refused"
+}

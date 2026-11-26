@@ -1,22 +1,310 @@
-input: 
-matched: None
-confidence: None
-conclusion: 时间窗口内发现 8 条 ERROR/FATAL 事件。分类：node_state×4、distribution×3、auth×1。需结合发生时间与跨节点关联判断是否与当前故障相关。跨节点关联（confirmed/candidate/insufficient）只说明两侧日志是否属于同一执行上下文，不等于故障根因已确认；根因结论须结合错误签名与验证步骤。
-errors_in_window: 8  category_counts={'node_state': 4, 'distribution': 3, 'auth': 1}
-  [2026-11-20T09:38:53.307+00:00] coordinator FATAL: the database system is in recovery mode
-  [2026-11-20T09:40:25.276+00:00] coordinator ERROR: default group not defined
-  [2026-11-20T09:41:12.628+00:00] coordinator FATAL: terminating connection due to administrator command
-  [2026-11-20T09:42:36.474+00:00] coordinator ERROR: default group not defined
-  [2026-11-20T10:01:00.000+00:00] coordinator ERROR: (28000) role "nobody" does not exist
-  [2026-11-20T10:02:00.000+00:00] coordinator ERROR: (42704) PGXC Group nonexist_group: group not defined
-  [2026-11-20T09:43:54.411+00:00] datanode FATAL: terminating connection due to administrator command
-  [2026-11-20T09:43:54.411+00:00] datanode FATAL: terminating connection due to administrator command
-correlations: 7
-  [confirmed] coord=2533,76 reason=CN 同 coord 记录与时间窗口内的 DN WARNING 及以上事件配对；只确认上下文关联，不确认因果或根因
-  [insufficient] coord=2901,6 reason=DN 侧日志无同 coord 记录（DN 日志缺失/轮转/未记录，或对侧事件在请求窗口外）
-  [insufficient] coord=2900,5 reason=DN 侧日志无同 coord 记录（DN 日志缺失/轮转/未记录，或对侧事件在请求窗口外）
-  [insufficient] coord=2472,33 reason=DN 侧日志无同 coord 记录（DN 日志缺失/轮转/未记录，或对侧事件在请求窗口外）
-  [insufficient] coord=2289,0 reason=DN 侧日志无同 coord 记录（DN 日志缺失/轮转/未记录，或对侧事件在请求窗口外）
-  [insufficient] coord=2334,11 reason=DN 侧日志无同 coord 记录（DN 日志缺失/轮转/未记录，或对侧事件在请求窗口外）
-  [insufficient] coord=2277,0 reason=DN 侧日志无同 coord 记录（DN 日志缺失/轮转/未记录，或对侧事件在请求窗口外）
-root_cause: determined=False note=跨节点关联（confirmed/candidate/insufficient）只说明两侧日志是否属于同一执行上下文；关联确认不等于故障根因已确认。根因需结合错误签名与验证步骤确认，本工具只提供证据，不自动判定根因。
+{
+  "window": "最近 168.0 小时",
+  "read_errors": [],
+  "unparsed_lines": 1,
+  "unparsed_files": [],
+  "total_parsed": 16,
+  "error_fatal_in_window": 8,
+  "category_counts": {
+    "node_state": 4,
+    "distribution": 3,
+    "auth": 1
+  },
+  "errors": [
+    {
+      "time": "2026-11-20T09:38:53.307+00:00",
+      "pid": 2277,
+      "coord": "2277,0",
+      "level": "FATAL",
+      "node": "coordinator",
+      "source": "tests/fixtures/logs/cn_sample.log:1",
+      "sqlstate": "",
+      "message": "the database system is in recovery mode",
+      "message_truncated": false,
+      "categories": [
+        "node_state"
+      ]
+    },
+    {
+      "time": "2026-11-20T09:40:25.276+00:00",
+      "pid": 2334,
+      "coord": "2334,11",
+      "level": "ERROR",
+      "node": "coordinator",
+      "source": "tests/fixtures/logs/cn_sample.log:2",
+      "sqlstate": "",
+      "message": "default group not defined",
+      "message_truncated": false,
+      "categories": [
+        "distribution"
+      ]
+    },
+    {
+      "time": "2026-11-20T09:41:12.628+00:00",
+      "pid": 2289,
+      "coord": "2289,0",
+      "level": "FATAL",
+      "node": "coordinator",
+      "source": "tests/fixtures/logs/cn_sample.log:3",
+      "sqlstate": "",
+      "message": "terminating connection due to administrator command",
+      "message_truncated": false,
+      "categories": [
+        "node_state"
+      ]
+    },
+    {
+      "time": "2026-11-20T09:42:36.474+00:00",
+      "pid": 2472,
+      "coord": "2472,33",
+      "level": "ERROR",
+      "node": "coordinator",
+      "source": "tests/fixtures/logs/cn_sample.log:4",
+      "sqlstate": "",
+      "message": "default group not defined",
+      "message_truncated": false,
+      "categories": [
+        "distribution"
+      ]
+    },
+    {
+      "time": "2026-11-20T10:01:00.000+00:00",
+      "pid": 2900,
+      "coord": "2900,5",
+      "level": "ERROR",
+      "node": "coordinator",
+      "source": "tests/fixtures/logs/cn_sample.log:7",
+      "sqlstate": "28000",
+      "message": "(28000) role \"nobody\" does not exist",
+      "message_truncated": false,
+      "categories": [
+        "auth"
+      ]
+    },
+    {
+      "time": "2026-11-20T10:02:00.000+00:00",
+      "pid": 2901,
+      "coord": "2901,6",
+      "level": "ERROR",
+      "node": "coordinator",
+      "source": "tests/fixtures/logs/cn_sample.log:9",
+      "sqlstate": "42704",
+      "message": "(42704) PGXC Group nonexist_group: group not defined",
+      "message_truncated": false,
+      "categories": [
+        "distribution"
+      ]
+    },
+    {
+      "time": "2026-11-20T09:43:54.411+00:00",
+      "pid": 2545,
+      "coord": "2533,76",
+      "level": "FATAL",
+      "node": "datanode",
+      "source": "tests/fixtures/logs/dn1_sample.log:3",
+      "sqlstate": "",
+      "message": "terminating connection due to administrator command",
+      "message_truncated": false,
+      "categories": [
+        "node_state"
+      ]
+    },
+    {
+      "time": "2026-11-20T09:43:54.411+00:00",
+      "pid": 2544,
+      "coord": "2533,76",
+      "level": "FATAL",
+      "node": "datanode",
+      "source": "tests/fixtures/logs/dn2_sample.log:3",
+      "sqlstate": "",
+      "message": "terminating connection due to administrator command",
+      "message_truncated": false,
+      "categories": [
+        "node_state"
+      ]
+    }
+  ],
+  "correlations": [
+    {
+      "coord": "2533,76",
+      "time": "2026-11-20T09:43:54.414+00:00",
+      "cn_entry": {
+        "time": "2026-11-20T09:43:54.414+00:00",
+        "pid": 2533,
+        "coord": "2533,76",
+        "level": "LOG",
+        "node": "coordinator",
+        "source": "tests/fixtures/logs/cn_sample.log:6",
+        "sqlstate": "",
+        "message": "Changing connection state for node dn0001 pid: 2545, state FATAL ==> FATAL, invoker execRemote.c: 862",
+        "message_truncated": false,
+        "categories": [
+          "network"
+        ]
+      },
+      "dn_entries": [
+        {
+          "time": "2026-11-20T09:43:54.411+00:00",
+          "pid": 2545,
+          "coord": "2533,76",
+          "level": "FATAL",
+          "node": "datanode",
+          "source": "tests/fixtures/logs/dn1_sample.log:3",
+          "sqlstate": "",
+          "message": "terminating connection due to administrator command",
+          "message_truncated": false,
+          "categories": [
+            "node_state"
+          ]
+        },
+        {
+          "time": "2026-11-20T09:43:54.411+00:00",
+          "pid": 2544,
+          "coord": "2533,76",
+          "level": "FATAL",
+          "node": "datanode",
+          "source": "tests/fixtures/logs/dn2_sample.log:3",
+          "sqlstate": "",
+          "message": "terminating connection due to administrator command",
+          "message_truncated": false,
+          "categories": [
+            "node_state"
+          ]
+        }
+      ],
+      "confidence": "confirmed",
+      "reason": "CN 与 DN 同 coord 事件在配对窗口内命中（DN 侧含 WARNING 及以上事件），两侧属于同一执行上下文"
+    },
+    {
+      "coord": "2901,6",
+      "time": "2026-11-20T10:02:00.000+00:00",
+      "cn_entry": {
+        "time": "2026-11-20T10:02:00.000+00:00",
+        "pid": 2901,
+        "coord": "2901,6",
+        "level": "ERROR",
+        "node": "coordinator",
+        "source": "tests/fixtures/logs/cn_sample.log:9",
+        "sqlstate": "42704",
+        "message": "(42704) PGXC Group nonexist_group: group not defined",
+        "message_truncated": false,
+        "categories": [
+          "distribution"
+        ]
+      },
+      "dn_entries": [],
+      "confidence": "insufficient",
+      "reason": "DN 侧日志无同 coord 记录（DN 日志缺失/轮转/未记录，或对侧事件在请求窗口外）"
+    },
+    {
+      "coord": "2900,5",
+      "time": "2026-11-20T10:01:00.000+00:00",
+      "cn_entry": {
+        "time": "2026-11-20T10:01:00.000+00:00",
+        "pid": 2900,
+        "coord": "2900,5",
+        "level": "ERROR",
+        "node": "coordinator",
+        "source": "tests/fixtures/logs/cn_sample.log:7",
+        "sqlstate": "28000",
+        "message": "(28000) role \"nobody\" does not exist",
+        "message_truncated": false,
+        "categories": [
+          "auth"
+        ]
+      },
+      "dn_entries": [],
+      "confidence": "insufficient",
+      "reason": "DN 侧日志无同 coord 记录（DN 日志缺失/轮转/未记录，或对侧事件在请求窗口外）"
+    },
+    {
+      "coord": "2472,33",
+      "time": "2026-11-20T09:42:36.474+00:00",
+      "cn_entry": {
+        "time": "2026-11-20T09:42:36.474+00:00",
+        "pid": 2472,
+        "coord": "2472,33",
+        "level": "ERROR",
+        "node": "coordinator",
+        "source": "tests/fixtures/logs/cn_sample.log:4",
+        "sqlstate": "",
+        "message": "default group not defined",
+        "message_truncated": false,
+        "categories": [
+          "distribution"
+        ]
+      },
+      "dn_entries": [],
+      "confidence": "insufficient",
+      "reason": "DN 侧日志无同 coord 记录（DN 日志缺失/轮转/未记录，或对侧事件在请求窗口外）"
+    },
+    {
+      "coord": "2289,0",
+      "time": "2026-11-20T09:41:12.628+00:00",
+      "cn_entry": {
+        "time": "2026-11-20T09:41:12.628+00:00",
+        "pid": 2289,
+        "coord": "2289,0",
+        "level": "FATAL",
+        "node": "coordinator",
+        "source": "tests/fixtures/logs/cn_sample.log:3",
+        "sqlstate": "",
+        "message": "terminating connection due to administrator command",
+        "message_truncated": false,
+        "categories": [
+          "node_state"
+        ]
+      },
+      "dn_entries": [],
+      "confidence": "insufficient",
+      "reason": "DN 侧日志无同 coord 记录（DN 日志缺失/轮转/未记录，或对侧事件在请求窗口外）"
+    },
+    {
+      "coord": "2334,11",
+      "time": "2026-11-20T09:40:25.276+00:00",
+      "cn_entry": {
+        "time": "2026-11-20T09:40:25.276+00:00",
+        "pid": 2334,
+        "coord": "2334,11",
+        "level": "ERROR",
+        "node": "coordinator",
+        "source": "tests/fixtures/logs/cn_sample.log:2",
+        "sqlstate": "",
+        "message": "default group not defined",
+        "message_truncated": false,
+        "categories": [
+          "distribution"
+        ]
+      },
+      "dn_entries": [],
+      "confidence": "insufficient",
+      "reason": "DN 侧日志无同 coord 记录（DN 日志缺失/轮转/未记录，或对侧事件在请求窗口外）"
+    },
+    {
+      "coord": "2277,0",
+      "time": "2026-11-20T09:38:53.307+00:00",
+      "cn_entry": {
+        "time": "2026-11-20T09:38:53.307+00:00",
+        "pid": 2277,
+        "coord": "2277,0",
+        "level": "FATAL",
+        "node": "coordinator",
+        "source": "tests/fixtures/logs/cn_sample.log:1",
+        "sqlstate": "",
+        "message": "the database system is in recovery mode",
+        "message_truncated": false,
+        "categories": [
+          "node_state"
+        ]
+      },
+      "dn_entries": [],
+      "confidence": "insufficient",
+      "reason": "DN 侧日志无同 coord 记录（DN 日志缺失/轮转/未记录，或对侧事件在请求窗口外）"
+    }
+  ],
+  "root_cause": {
+    "determined": false,
+    "note": "日志关联用于识别跨节点异常事件，错误签名用于提供可能原因及排查建议；结合运行状态、错误上下文及验证结果定位具体原因。"
+  },
+  "conclusion": "时间窗口内发现 8 条 ERROR/FATAL 事件。分类：node_state×4、distribution×3、auth×1。结合发生时间与跨节点关联判断与当前故障的相关性。跨节点关联（confirmed/candidate/insufficient）表示两侧日志是否属于同一执行上下文；日志关联用于识别跨节点异常事件，错误签名用于提供可能原因及排查建议，结合运行状态、错误上下文及验证结果定位具体原因。"
+}

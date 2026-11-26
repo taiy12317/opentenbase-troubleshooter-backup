@@ -149,6 +149,6 @@ cp -r skills/otb-cluster-inspector ~/.qoder-cn/skills/
 | `skills/` | 两个 Qoder Skill（各含 SKILL.md） |
 | `references/error-cases.md` | 故障知识库 |
 | `contrib-standalone/otb_preflight.py` | 零依赖单文件预检脚本 |
-| `examples/` | diagnose 三条路径的真实运行产物 |
+| `examples/` | diagnose 离线诊断示例（含固定日志样例，见 [样例说明](examples/README.md)） |
 | `tests/` | 单元测试（242 项） |
 | `测试报告.md` / `演示记录.md` | 测试结果与使用场景 |
