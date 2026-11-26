@@ -19,6 +19,8 @@ def _run(cmd: list[str], timeout: int = 5) -> tuple[int, str, str]:
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
     except FileNotFoundError as exc:
         return 127, "", str(exc)
+    except OSError as exc:
+        return 126, "", str(exc)
     except subprocess.TimeoutExpired:
         return 124, "", f"command timed out after {timeout}s"
 

@@ -49,7 +49,7 @@ otb-tools inspect --conn "<libpq 连接串>" [--log-dir /data/opentenbase-lab/lo
 
 检查项：CN 连接、pgxc_node 注册、pgxc_group、注册端口 vs 实际监听、节点进程、CN→DN 直连、跨节点生效配置对比、会话与异常会话、连接水位、pg_prepared_xacts、数据分布与倾斜检查（data.skew）、日志错误扫描、跨节点日志关联（结果在 `correlations` 字段）。数据库连不上时自动降级：端口（需 `--ports`）、进程、日志检查继续执行，其余标记 SKIP。
 
-data.skew 解读：按 `xc_node_id` 统计各 DN 行数——最大/最小 ≥ 2 → WARN（行数不均衡影响并行查询性能与节点负载，不影响查询正确性，也可能是有意为之）；完全倾斜（存在 0 行节点）且总行数 ≥ `--skew-fail-min-rows`（默认 1 万）→ FAIL，低于阈值降级 WARN。`reltuples` 超 `--skew-max-rows` 或未 ANALYZE 的表默认不精确扫描，`pg_stats` 零扫描风险提示仅作提示、不参与判定；`--skew-tables` 显式强制。调整分布需重建表（DISTRIBUTE BY SHARD），只读巡检不自动调整。
+data.skew 解读：按 `xc_node_id` 统计各 DN 行数——最大/最小 ≥ 2 → WARN（行数不均衡影响并行查询性能与节点负载，不影响查询正确性，也可能是有意为之）；完全倾斜（存在 0 行节点）且总行数 ≥ `--skew-fail-min-rows`（默认 1 万）→ FAIL，低于阈值降级 WARN。`reltuples` 超 `--skew-max-rows` 或未 ANALYZE 的表默认不精确扫描，`pg_stats` 零扫描风险提示仅作提示、不参与判定；`--skew-tables` 显式强制。分布节点范围元数据异常（nodeoids 无法映射等）时只报告、不判定均衡。调整分布需重建表（DISTRIBUTE BY SHARD），只读巡检不自动调整。
 
 ## diagnose 用法
 
@@ -89,13 +89,12 @@ diagnose 退出码（离线分析语义，与 inspect 的健康检查语义不�
 
 - 状态含义：PASS 正常；WARN 需关注但不判故障（参数差异、存在 2PC、非 idle 会话、窗口内历史错误）；FAIL 明确异常；ERROR 工具执行失败/证据不完整；SKIP 条件不满足未检查。
 - inspect 退出码（健康检查语义）：0 无 FAIL 级问题（WARN 允许）/ 1 存在 FAIL（--strict 下 WARN 也计 1）/ 2 执行失败或关键检查不完整 / 3 参数错误。JSON 输出含 `execution_status`（工具是否执行完成）与 `health_status`（集群是否健康），两者含义不同。
-- 关联置信度：`confirmed`（双侧事件、时间窗口内）/ `candidate`（级别不足或疑似 PID 复用）/ `insufficient`（对侧无记录）。置信度表示两侧日志是否属于同一执行上下文；根因判定由错误签名匹配给出（`root_cause` 字段）。
-- SQLSTATE 只标识错误类别，同一错误码可由不同原因触发。42704（undefined_object）是名称解析失败类别：`type "x" does not exist` 指当前 search_path 可见范围内没有该类型——普通表会自动创建同名复合类型（OpenTenBase v5.0/PG10 实测），由 relkind='r' 不能推断「类型不存在」；核对 pg_type + pg_namespace + SHOW search_path + 原始 SQL 后下结论。
+- 关联置信度：`confirmed` 要求双侧事件在配对窗口内且 CN 来源身份无歧义；级别不足、疑似 PID 复用或同一 DN 配对窗口内出现多个不同 CN 来源时为 `candidate`；对侧无记录为 `insufficient`。`diagnose` 没有 CN 节点名时用来源文件区分；多个文件无法区分多 CN 与日志轮转时保守标为候选，不按文件名猜节点。该置信度描述日志关联证据，不代表根因已确定；根因仍需结合运行状态、错误上下文和验证结果判断（`root_cause` 字段显式区分）。
+- SQLSTATE 只标识错误类别，同一错误码可由不同原因触发。42704（undefined_object）是名称解析失败类别：`type "x" does not exist` 指当前 search_path 可见范围内没有该类型；普通表创建时自动生成同名复合类型（typtype='c'、typrelid 指回表），该错误不代表表不存在。核对 pg_type + pg_namespace + SHOW search_path + 原始 SQL 后下结论。
 - 引用日志错误时带发生时间与窗口；参数差异、存在 prepared transaction、非 idle 会话均需结合判断依据报告。
 
 ## 约束
 
-- 全部只读：不启停节点、不改配置、不清理 2PC、不杀会话。
-- 节点连接失败时其他检查继续；日志不可读（权限不足）只影响日志项。
-- 日志关联基于默认 stderr 格式的 `coord(pid,vxid)` 字段（DN 日志携带 CN 后端 pid，已实测）；不依赖 csvlog/global trace id（默认关闭）。
+- 全部只读：不启停节点、不改配置、不清理 2PC、不杀会话；节点连接失败时其他检查继续，日志不可读（权限不足）只影响日志项。
+- 日志关联基于默认 stderr 格式的 `coord(pid,vxid)` 字段；不依赖 csvlog/global trace id（默认关闭）。
 - 故障知识库与 OpenTenBase 特有接口限制（无 pg_stat_statements、无 pgxc_lock_for_backends、无 pg_current_setting、普通用户读不了 pg_file_settings）见仓库 `references/error-cases.md`。

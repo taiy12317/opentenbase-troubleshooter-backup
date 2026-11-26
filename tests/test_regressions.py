@@ -112,6 +112,22 @@ class TestCorrelationWindowPrefilter:
         result = diagnostics.diagnose_logs([str(cn)], [str(dn)], timedelta(hours=24))
         assert result["correlations"][0]["confidence"] == "confirmed"
 
+    def test_diagnose_multiple_cn_files_with_colliding_key_is_candidate(self, tmp_path):
+        """diagnose 只有 coordinator 角色时以来源文件区分潜在 CN，歧义降级。"""
+        now = datetime.now(timezone.utc)
+        t0 = now - timedelta(seconds=60)
+        cn1, cn2, dn = tmp_path / "cn-a.log", tmp_path / "cn-b.log", tmp_path / "dn.log"
+        cn1.write_text(_log_line(t0, 1000, 500, 1, "ERROR", "first CN"))
+        cn2.write_text(_log_line(t0 + timedelta(seconds=40), 1001, 500, 1, "LOG", "second CN"))
+        dn.write_text(_log_line(t0 + timedelta(seconds=20), 2000, 500, 1, "WARNING", "DN event"))
+
+        result = diagnostics.diagnose_logs(
+            [str(cn1), str(cn2)], [str(dn)], timedelta(hours=24),
+        )
+        corr = next(c for c in result["correlations"] if c["coord"] == "500,1")
+        assert corr["confidence"] == "candidate"
+        assert "多个不同/不明 CN 来源" in corr["reason"]
+
     def test_boundary_events_included_excluded(self, tmp_path):
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(hours=24)
@@ -245,15 +261,19 @@ NODE_COLS = ["oid", "node_name", "node_type", "node_port", "node_host", "nodeis_
 
 
 def _mock_cluster(monkeypatch, tmp_path, nodes, values, fail_ports=(),
-                  run_sql_raise_ports=(), raise_params=(), tcp_open=True):
+                  run_sql_raise_ports=(), raise_params=(), tcp_open=True,
+                  param_fail_ports=None):
     """构造 Mock 多主机集群：CN 192.0.2.10:15001，DN 注册 host 与 CN 不同。
 
     返回 (captured_conninfos, conns)。fake_run_sql 按查询文本分派；values
     为 {port: {param: value}}；fail_ports 中的端口 connect 抛 ConnectionError；
     run_sql_raise_ports 中的端口在 current_setting('port') 时抛 RuntimeError；
-    raise_params 中的参数在所有节点的 current_setting 查询抛 RuntimeError。
+    raise_params 中的参数在所有节点的 current_setting 查询抛 RuntimeError；
+    param_fail_ports（{port: [param, ...]}）限定参数在部分节点失败。
     """
     from psycopg2.extensions import parse_dsn
+
+    param_fail_ports = param_fail_ports or {}
 
     class FakeConn:
         def __init__(self, conninfo):
@@ -281,7 +301,7 @@ def _mock_cluster(monkeypatch, tmp_path, nodes, values, fail_ports=(),
             raise RuntimeError("simulated query failure")
         if "current_setting" in sql:
             p = sql.split("'")[1]
-            if p in raise_params:
+            if p in raise_params or p in param_fail_ports.get(port, []):
                 raise RuntimeError(f"simulated param query failure: {p}")
             if p == "port":
                 return [(str(port),)], ["current_setting"]
@@ -414,6 +434,22 @@ class TestDnRegisteredHost:
         assert cfg_item.status == Status.PASS
         assert any("GTM 协议节点" in f for f in cfg_item.facts)
 
+    def test_invalid_registered_port_reported_not_crash(self, monkeypatch, tmp_path):
+        # 非法端口字符串（非数字）：cfg.effective 构造连接串前须捕获，不得崩溃
+        nodes = self.NODES + [(103, "dn0003", "D", "abc", "192.0.2.13", True, 3)]
+        values = {p: {"max_connections": "100"} for p in (15001, 15401, 15402)}
+        _mock_cluster(monkeypatch, tmp_path, nodes, values)
+        cfg = inspector.InspectorConfig(
+            conninfo="host=192.0.2.10 port=15001 user=student",
+            log_dir=str(tmp_path), log_files={},
+        )
+        report = inspector.run(cfg)  # 旧实现 cfg.effective 在 try/except 外 int() 直接崩溃
+        items = {i.id: i for i in report.items}
+        cfg_item = items["cfg.effective"]
+        assert cfg_item.status == Status.ERROR
+        assert any("注册端口无效" in e for e in cfg_item.evidence)
+        assert any("注册端口无效" in e for e in items["conn.direct_dn"].evidence)
+
     def test_default_log_files_exclude_gtm(self):
         cfg = inspector.InspectorConfig(conninfo="host=x port=1 user=u")
         # GTM 日志非 PG stderr 格式（实测全部行无法解析），默认只扫 CN/DN
@@ -539,7 +575,7 @@ class TestEffectiveConfigStatusPrecedence:
         assert report.overall_exit_code() == 0  # 纯差异（全部采集成功）不触发非零
 
     def test_query_failure_on_one_dn_direct_item_fail(self, monkeypatch, tmp_path):
-        # 单节点查询异常：直连项如实 FAIL，配置项按已采集值继续，连接被关闭
+        # 单节点查询异常：直连项按失败报告 FAIL，配置项按已采集值继续，连接被关闭
         values = self._values((15001, 15401, 15402))
         captured, conns = _mock_cluster(monkeypatch, tmp_path, TestDnRegisteredHost.NODES,
                                         values, run_sql_raise_ports=(15401,))
@@ -553,6 +589,39 @@ class TestEffectiveConfigStatusPrecedence:
         assert any("simulated query failure" in e for e in items["conn.direct_dn"].evidence)
         dn1_conns = [c for c in conns if "15401" in c.conninfo]
         assert dn1_conns and all(c.closed for c in dn1_conns)  # 异常路径连接不泄漏
+
+    def test_partial_param_failure_no_diff_is_warn_exit_0(self, monkeypatch, tmp_path):
+        # max_connections 仅 dn1 采集失败：不得输出无条件「取值一致」PASS
+        values = self._values((15001, 15401, 15402))
+        _mock_cluster(monkeypatch, tmp_path, TestDnRegisteredHost.NODES, values,
+                      param_fail_ports={15401: ["max_connections"]})
+        cfg = inspector.InspectorConfig(
+            conninfo="host=192.0.2.10 port=15001 user=student",
+            log_dir=str(tmp_path), log_files={},
+        )
+        report = inspector.run(cfg)
+        cfg_item = next(i for i in report.items if i.id == "cfg.effective")
+        assert cfg_item.status == Status.WARN
+        assert "部分节点采集失败" in cfg_item.summary
+        assert any("max_connections" in f and "部分节点采集失败" in f for f in cfg_item.facts)
+        assert report.overall_exit_code() == 0
+
+    def test_partial_param_failure_with_diff_still_warn(self, monkeypatch, tmp_path):
+        # 部分参数失败 + 已采集参数存在差异：WARN 差异结论，facts 注明采集不完整
+        values = self._values((15001, 15401, 15402))
+        values[15402]["shared_buffers"] = "64MB"
+        _mock_cluster(monkeypatch, tmp_path, TestDnRegisteredHost.NODES, values,
+                      param_fail_ports={15401: ["max_connections"]})
+        cfg = inspector.InspectorConfig(
+            conninfo="host=192.0.2.10 port=15001 user=student",
+            log_dir=str(tmp_path), log_files={},
+        )
+        report = inspector.run(cfg)
+        cfg_item = next(i for i in report.items if i.id == "cfg.effective")
+        assert cfg_item.status == Status.WARN
+        assert "节点间存在参数差异" in cfg_item.summary
+        assert any("部分节点采集失败" in f for f in cfg_item.facts)
+        assert report.overall_exit_code() == 0
 
 
 # ---------------------------------------------------------------- 问题 5

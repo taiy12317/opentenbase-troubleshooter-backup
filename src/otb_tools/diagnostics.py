@@ -83,7 +83,8 @@ def diagnose_logs(
 
     other_paths 中的文件只做错误扫描，不参与跨节点关联。
     关联置信度（confirmed/candidate/insufficient）表示两侧日志是否同属一个
-    执行上下文；根因判定由错误签名匹配与验证步骤给出。
+    执行上下文；日志关联用于识别跨节点异常事件，错误签名用于提供可能原因及
+    排查建议，结合运行状态、错误上下文及验证结果定位具体原因。
     """
     cutoff = log_parser.now_utc() - window
     entries: list[LogEntry] = []
@@ -151,8 +152,8 @@ def diagnose_logs(
         "root_cause": {
             "determined": False,
             "note": (
-                "跨节点关联的置信度表示两侧日志是否属于同一执行上下文；"
-                "根因判定由错误签名匹配与验证步骤给出（见 diagnose 文本诊断输出）。"
+                "日志关联用于识别跨节点异常事件，错误签名用于提供可能原因及排查建议；"
+                "结合运行状态、错误上下文及验证结果定位具体原因。"
             ),
         },
         "conclusion": _conclusion(len(error_lines), category_counts, read_errors, format_mismatch),
@@ -161,6 +162,7 @@ def diagnose_logs(
 
 def _conclusion(n_errors: int, cats: dict, read_errors: list, format_mismatch: list) -> str:
     parts = []
+    incomplete = bool(read_errors) or bool(format_mismatch)
     if read_errors:
         parts.append(f"{len(read_errors)} 个日志文件无法读取（证据不完整）：{'；'.join(read_errors)}")
     if format_mismatch:
@@ -168,12 +170,14 @@ def _conclusion(n_errors: int, cats: dict, read_errors: list, format_mismatch: l
             f"{len(format_mismatch)} 个日志文件全部行无法解析（格式与解析器不匹配，"
             f"错误扫描与关联无证据）：{'；'.join(format_mismatch)}"
         )
-    if n_errors == 0:
-        parts.append("时间窗口内未发现 ERROR/FATAL 日志。")
-    else:
-        parts.append(f"时间窗口内发现 {n_errors} 条 ERROR/FATAL 事件")
+    if n_errors > 0:
+        prefix = "可解析部分发现" if incomplete else "时间窗口内发现"
+        parts.append(f"{prefix} {n_errors} 条 ERROR/FATAL 事件")
         if cats:
             parts.append("分类：" + "、".join(f"{k}×{v}" for k, v in sorted(cats.items(), key=lambda kv: -kv[1])))
         parts.append("结合发生时间与跨节点关联判断与当前故障的相关性。")
-    parts.append("跨节点关联（confirmed/candidate/insufficient）表示两侧日志是否属于同一执行上下文；根因判定由错误签名匹配与验证步骤给出。")
+    elif not incomplete:
+        # 只在全部日志均成功解析时才可断言「未发现」
+        parts.append("时间窗口内未发现 ERROR/FATAL 日志。")
+    parts.append("跨节点关联（confirmed/candidate/insufficient）表示两侧日志是否属于同一执行上下文；日志关联用于识别跨节点异常事件，错误签名用于提供可能原因及排查建议，结合运行状态、错误上下文及验证结果定位具体原因。")
     return "。".join(p.rstrip("。") for p in parts) + "。"

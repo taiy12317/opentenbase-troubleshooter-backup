@@ -99,6 +99,70 @@ class TestCorrelate:
         assert len(c["dn_entries"]) == 2  # dn1 与 dn2 各一条 FATAL
         assert c["cn_entry"]["level"] == "LOG"
 
+    def test_multiple_cn_identities_paired_to_same_dn_are_candidate(self):
+        from datetime import datetime, timedelta, timezone
+
+        from otb_tools.log_parser import LogEntry
+
+        base = datetime(2026, 11, 26, 0, 0, 0, tzinfo=timezone.utc)
+
+        def entry(node, source, seconds, level, pid):
+            return LogEntry(
+                ts=base + timedelta(seconds=seconds), pid=pid, coord_pid=900, coord_vxid=1,
+                level=level, message=f"{node} event", node=node, source=source,
+            )
+
+        cn1 = entry("cn0001", "cn1.log", 0, "ERROR", 100)
+        cn2 = entry("cn0002", "cn2.log", 40, "LOG", 200)
+        dn = entry("dn0001", "dn1.log", 20, "WARNING", 300)
+        corr = log_parser.correlate([cn1, cn2], [dn], window=timedelta(seconds=30))[0]
+        assert corr["confidence"] == "candidate"
+        assert "多个不同/不明 CN 来源" in corr["reason"]
+
+    def test_cn_sources_from_separate_pair_windows_do_not_cause_ambiguity(self):
+        from datetime import datetime, timedelta, timezone
+
+        from otb_tools.log_parser import LogEntry
+
+        base = datetime(2026, 11, 26, 0, 0, 0, tzinfo=timezone.utc)
+
+        def entry(node, source, seconds, level, pid):
+            return LogEntry(
+                ts=base + timedelta(seconds=seconds), pid=pid, coord_pid=900, coord_vxid=1,
+                level=level, message=f"{node} event", node=node, source=source,
+            )
+
+        cn1 = entry("cn0001", "cn1.log", 0, "ERROR", 100)
+        cn2 = entry("cn0002", "cn2.log", 600, "LOG", 200)
+        dn1 = entry("dn0001", "dn1.log", 0, "WARNING", 300)
+        dn2 = entry("dn0002", "dn2.log", 600, "WARNING", 400)
+        corr = log_parser.correlate([cn1, cn2], [dn1, dn2], window=timedelta(seconds=30))[0]
+        assert corr["confidence"] == "confirmed"
+        assert corr["cn_entry"]["node"] == "cn0002"
+        assert [d["node"] for d in corr["dn_entries"]] == ["dn0002"]
+
+    def test_same_cn_identity_across_rotated_sources_remains_confirmed(self):
+        from datetime import datetime, timedelta, timezone
+
+        from otb_tools.log_parser import LogEntry
+
+        base = datetime(2026, 11, 26, 0, 0, 0, tzinfo=timezone.utc)
+
+        def entry(source, seconds, level, pid):
+            return LogEntry(
+                ts=base + timedelta(seconds=seconds), pid=pid, coord_pid=901, coord_vxid=2,
+                level=level, message="same coordinator", node="cn0001", source=source,
+            )
+
+        cn_a = entry("cn.log", 0, "ERROR", 101)
+        cn_b = entry("cn.log.1", 1, "LOG", 102)
+        dn = LogEntry(
+            ts=base + timedelta(seconds=2), pid=301, coord_pid=901, coord_vxid=2,
+            level="WARNING", message="dn event", node="dn0001", source="dn.log",
+        )
+        corr = log_parser.correlate([cn_a, cn_b], [dn])[0]
+        assert corr["confidence"] == "confirmed"
+
     def test_insufficient_when_dn_side_missing(self):
         cn, _ = log_parser.parse_file(os.path.join(FIX, "cn_sample.log"), node="cn")
         corr = log_parser.correlate(cn, [])

@@ -73,7 +73,7 @@ class TestSkewUnit:
         item = _run_skew(monkeypatch, catalog, counts={"public.t_all": [(1, 15000)]})
         assert item.status == Status.FAIL
         assert "完全倾斜" in item.summary
-        assert any("其余 1 个 DN=0 行" in e for e in item.evidence)
+        assert any("dn0002=0 行" in e for e in item.evidence)
         assert "重建表" in item.fix_hint
 
     def test_complete_skew_small_downgraded_warn(self, monkeypatch):
@@ -191,17 +191,33 @@ class TestSkewNodeoids:
         assert any("dn0002、dn0003=0 行" in e for e in item.evidence)
 
     def test_unmatched_nodeoids_oid_fact(self, monkeypatch):
+        # nodeoids 无法完全映射到 pgxc_node：节点范围不可靠，不得基于回退 DN 集断言 0 行节点，也不得判均衡
         catalog = [(1, "public", "t", 100, "H", "1", "101 999")]
         item = self._run3(monkeypatch, catalog, counts={"public.t": [(1, 50), (2, 50)]})
-        assert item.status == Status.PASS
-        assert any("未匹配 pgxc_node.oid" in f for f in item.facts)
-        # 回归：counts 节点数多于 nodeoids 匹配数（missing<0）时不得误置 minv=0 判 WARN
-        assert any("均衡" in e for e in item.evidence)
+        assert item.status == Status.WARN
+        assert any("无法映射到 pgxc_node" in f for f in item.facts)
+        assert any("分布元数据异常" in e for e in item.evidence)
+        assert not any("0 行" in e for e in item.evidence)
+        assert not any("→ 均衡" in e for e in item.evidence)
+
+    def test_unexpected_node_meta_problem(self, monkeypatch):
+        # counts 含 nodeoids 范围外的节点（dn0003）：元数据不一致，单独报告，不判均衡
+        catalog = [(1, "public", "t", 1000, "H", "1", "101 102")]
+        item = self._run3(monkeypatch, catalog, counts={"public.t": [(1, 50), (2, 50), (3, 50)]})
+        assert item.status == Status.WARN
+        assert any("分布范围外的节点" in f for f in item.facts)
+        assert any("分布元数据异常" in e for e in item.evidence)
+        assert not any("0 行" in e for e in item.evidence)
+        assert not any("→ 均衡" in e for e in item.evidence)
 
     def test_unknown_xc_node_id_fact(self, monkeypatch):
         catalog = [(1, "public", "t", 1000, "H", "1", "101 102")]
         item = self._run3(monkeypatch, catalog, counts={"public.t": [(1, 80), (2, 100), (9, 20)]})
         assert any("未注册到 pgxc_node" in f for f in item.facts)
+        # 未注册节点使计数无法与节点名可靠对应：不判均衡、不断言 0 行节点
+        assert item.status == Status.WARN
+        assert not any("0 行" in e for e in item.evidence)
+        assert not any("→ 均衡" in e for e in item.evidence)
 
 
 class TestSkewCli:

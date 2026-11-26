@@ -142,6 +142,22 @@ def _level_rank(level: str) -> int:
     return {"LOG": 0, "WARNING": 1, "ERROR": 2, "FATAL": 3, "PANIC": 4}.get(level, -1)
 
 
+def _cn_source_identity(entry: LogEntry) -> tuple[str, str] | None:
+    """Return a usable CN identity, preferring node identity over source file.
+
+    diagnose labels all CN files as ``coordinator``; there the source path is
+    the only available discriminator. Multiple paths may be separate CNs or
+    rotations, so a collision across them is conservatively ambiguous.
+    """
+    node = (entry.node or "").strip()
+    if node and node.lower() not in {"cn", "coordinator"}:
+        return ("node", node)
+    source = (entry.source or "").strip()
+    if source:
+        return ("source", source)
+    return None
+
+
 def correlate(
     cn_entries: list[LogEntry],
     dn_entries: list[LogEntry],
@@ -155,8 +171,8 @@ def correlate(
     置信度分级（按 coord 键聚合后）：
       confirmed   - 窗口内存在配对，且（CN 侧有 ERROR/FATAL 且 DN 侧有 WARNING 及以上）
                     或（DN 侧有 WARNING 及以上且 CN 侧有任意级别记录，如连接状态迁移 LOG）；
-      candidate   - 两侧都有记录但级别不足（仅 LOG），或同键但所有配对都超出时间窗口
-                    （可能为 PID 复用）；
+      candidate   - 两侧都有记录但级别不足（仅 LOG），同键配对超出时间窗口
+                    （可能为 PID 复用），或同一 DN 配对窗口内出现多个来源不明的 CN；
       insufficient- 只有单侧记录（对侧日志缺失/轮转/未记录该事件）。
 
     两个时间约束必须区分，由不同层负责：
@@ -230,11 +246,32 @@ def correlate(
         if confirmed_pair:
             c, matched_dns = confirmed_pair
             event_time = max([c.ts, *(d.ts for d in matched_dns)])
-            results.append(make_result(
-                key, c, matched_dns, "confirmed",
-                "CN 与 DN 同 coord 事件在配对窗口内命中（DN 侧含 WARNING 及以上事件），两侧属于同一执行上下文",
-                event_time, len(matched_dns),
-            ))
+            selected_identity = _cn_source_identity(c)
+            matched_dn_ids = {id(d) for d in matched_dns}
+            ambiguous_cn = False
+            for other in cn_ev:
+                if other is c:
+                    continue
+                other_identity = _cn_source_identity(other)
+                if selected_identity is not None and other_identity == selected_identity:
+                    continue
+                low = bisect_left(dn_warn_times, other.ts - timedelta(seconds=window_seconds))
+                high = bisect_right(dn_warn_times, other.ts + timedelta(seconds=window_seconds))
+                if any(id(d) in matched_dn_ids for d in dn_warn[low:high]):
+                    ambiguous_cn = True
+                    break
+            if ambiguous_cn:
+                results.append(make_result(
+                    key, c, matched_dns, "candidate",
+                    "同一 DN 配对窗口内出现多个不同/不明 CN 来源的同 coord 事件，无法确认来源，降级为候选",
+                    event_time, len(matched_dns),
+                ))
+            else:
+                results.append(make_result(
+                    key, c, matched_dns, "confirmed",
+                    "CN 与 DN 同 coord 事件在配对窗口内命中（DN 侧含 WARNING 及以上事件），两侧属于同一执行上下文",
+                    event_time, len(matched_dns),
+                ))
         elif low_level_pair:
             c, matched_dns = low_level_pair
             event_time = max([c.ts, *(d.ts for d in matched_dns)])

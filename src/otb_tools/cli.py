@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from datetime import timedelta
 
@@ -34,7 +35,7 @@ def _positive_float(s: str) -> float:
         v = float(s)
     except ValueError:
         raise argparse.ArgumentTypeError(f"需要数字: {s!r}")
-    if not v > 0:
+    if not math.isfinite(v) or not v > 0:
         raise argparse.ArgumentTypeError(f"需要正数: {s!r}")
     return v
 
@@ -61,8 +62,8 @@ def _non_negative_float(s: str) -> float:
         v = float(s)
     except ValueError:
         raise argparse.ArgumentTypeError(f"需要数字: {s!r}")
-    if v < 0:
-        raise argparse.ArgumentTypeError(f"需要非负数: {s!r}")
+    if not math.isfinite(v) or v < 0:
+        raise argparse.ArgumentTypeError(f"需要非负有限数: {s!r}")
     return v
 
 
@@ -131,7 +132,7 @@ def _build_preflight_parser(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--ports", type=_parse_ports, default=list(preflight.DEFAULT_PORTS))
     p.add_argument("--conf-files", default="")
     p.add_argument("--pg-hba-files", default="")
-    p.add_argument("--conn", default="", help="libpq 连接串；提供后追加部署后验证（数据库探测与认证检查），默认为部署前模式、不要求数据库已启动")
+    p.add_argument("--conn", default="", help="libpq 连接串；提供后追加部署后验证（数据库连接探测），默认为部署前模式、不要求数据库已启动")
     p.add_argument("--expect-running", action="store_true",
                    help="数据库应已在运行（端口未监听/连接拒绝视为 FAIL 而非预期）")
     p.add_argument("--probe-env", type=_parse_env_overrides, default={},

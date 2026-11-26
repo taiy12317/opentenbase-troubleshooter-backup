@@ -54,10 +54,11 @@
 ## 四、跨节点日志关联机制
 
 - 关联键与机制：默认 stderr 格式 `[pid,coord(coord_pid,coord_vxid)]`；DN 日志中的 coord 值由 CN 随每条语句下发（`'U'` 消息，postgres.c:8018-8041）。**source-verified + reproduced**。
-- 关联判定：DN 侧 FATAL 与 CN 侧 LOG（连接状态迁移）同 coord 配对，确认两侧属于同一故障事件。
-- 置信度分级：`confirmed`（双侧事件、时间窗口内）/ `candidate`（级别不足或疑似 PID 复用）/ `insufficient`（对侧无记录）。
+- 关联判定：DN 侧 WARNING 及以上与 CN 侧事件在 coord 配对窗口内命中，且 CN 来源身份无歧义时标 `confirmed`；同一 DN 事件的配对窗口内出现多个不同 CN 身份/来源时降级为 `candidate`，不从同数值 coord 键任意选择 CN。
+- 置信度分级：`confirmed`（双侧事件在窗口内且 CN 来源唯一）/ `candidate`（级别不足、疑似 PID 复用或 CN 来源歧义）/ `insufficient`（对侧无记录）。单 CN 的多 DN 事件仍可关联；相同明确 CN 节点的轮转文件视为同源。`diagnose` 只有角色没有 CN 节点名时使用来源文件区分；多文件可能是独立 CN，也可能是轮转，无法识别时保守标为候选，不按文件名推断。
 - 全局 trace id 与 csvlog：开启 `logging_collector=on + log_destination='stderr,csvlog'`（postmaster 级参数，重启生效）后，trace id 写入 csv 的 user_name 字段（复用）；CN 侧格式 `NC<全局递增seq>_<vxid>_0_0_0_0`（seq 与 PGXCQueryId `cn0001_<seq>` 对应），DN 侧格式 `YB<pid>_0`；DN csv 无 PGXCQueryId/语句记录，trace id 无法做 CN↔DN 跨节点关联；stderr 日志与 csvlog 并存（log_destination 含 stderr 时 -l 文件照常写入）。工具以 stderr coord 关联为主，实测 csvlog 开启状态下 diagnose 正常。csvlog 默认关闭且开启需重启各节点，不作为默认依赖。**reproduced（2026-11-24）**。
-- 关联判定需考虑：节点身份、时间窗口（默认 30s）、PID 复用（超窗口降级为候选）、日志缺失（标记证据不足）。
+- 关联判定需考虑：CN 节点身份、时间窗口（查询时间范围与默认 30s 配对窗口分开处理）、PID 复用（无窗口内配对时降级为候选）、多 CN 数值 coord 碰撞（同一 DN 配对窗口内多来源降级为候选）及日志缺失（标记证据不足）。
+- 语义边界：日志关联用于识别跨节点异常事件，错误签名用于提供可能原因及排查建议，结合运行状态、错误上下文及验证结果定位具体原因。
 
 ## 五、OpenTenBase 接口差异与特有行为
 
@@ -82,3 +83,4 @@
 | 扫描安全 | `reltuples` 超过 `--skew-max-rows`（默认 10 万）或未 ANALYZE（-1）的表默认不做精确全扫；`--skew-tables`（schema.table 或裸表名）显式强制 | reproduced（2026-11-25） |
 | 零扫描提示 | `pg_stats` 分布列 `n_distinct` ∈ (0,4) 或最常见值占比 ≥ 50% → 倾斜风险提示（仅提示，不参与状态判定）。`n_distinct=-1` 表示不同值数与行数相等；负值比例型仅 `|n_distinct|<0.1` 才提示 | reproduced（2026-11-25：k 列 n_distinct=2/最常见 80% → 提示；id 列 -1 → 不提示） |
 | 调整分布 | 需重建表：`CREATE TABLE ... DISTRIBUTE BY SHARD(合适列)` 后迁移数据；只读巡检不自动调整 | tool-design |
+| 分布节点范围元数据异常 | nodeoids 无法映射到 pgxc_node、出现范围外/未注册节点、行数查询返回未注册 xc_node_id 时，只报告异常、不判定均衡（不断言 0 行节点） | reproduced（2026-11-25） |

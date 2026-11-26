@@ -10,8 +10,10 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -59,6 +61,9 @@ def _run(cmd: list[str], env: dict | None = None, timeout: int = 10) -> tuple[in
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
     except FileNotFoundError as exc:
         return 127, "", str(exc)
+    except OSError as exc:
+        # 无执行权限等场景：仅记录证据，不透传为工具退出码
+        return 126, "", str(exc)
     except subprocess.TimeoutExpired:
         # 不回显命令本身：db.probe 的命令行含完整连接串（可能带密码），回显即泄漏
         return 124, "", f"command timed out after {timeout}s"
@@ -306,7 +311,7 @@ def _check_pg_hba_trust(cfg: PreflightConfig) -> Item:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 for lineno, line in enumerate(fh, 1):
                     stripped = line.strip()
-                    if stripped and not stripped.startswith("#") and stripped.split()[-1] == "trust":
+                    if _pg_hba_auth_method(stripped) == "trust":
                         trust_lines.append(f"{path}:{lineno}: {stripped}")
         except OSError as exc:
             item.status = Status.ERROR
@@ -324,6 +329,42 @@ def _check_pg_hba_trust(cfg: PreflightConfig) -> Item:
     return item
 
 
+def _pg_hba_auth_method(line: str) -> str | None:
+    """Extract the pg_hba authentication field without treating comments/options as it.
+
+    pg_hba records place the method after three fields for ``local`` and after
+    four fields for ``host`` variants. The legacy host/netmask form adds one
+    address field. shlex handles quoted fields and strips unquoted ``#`` comments.
+    This is intentionally a narrow field reader, not a full pg_hba validator.
+    """
+    lexer = shlex.shlex(line, posix=True)
+    lexer.quotes = '"'
+    lexer.whitespace_split = True
+    lexer.commenters = "#"
+    try:
+        fields = list(lexer)
+    except ValueError:
+        return None
+    if not fields:
+        return None
+    record = fields[0].lower()
+    if record == "local":
+        return fields[3].lower() if len(fields) > 3 else None
+    if record not in {"host", "hostssl", "hostnossl", "hostgssenc", "hostnogssenc"}:
+        return None
+    if len(fields) < 5:
+        return None
+    # A separate IPv4/IPv6 netmask follows the address in the legacy syntax.
+    if len(fields) > 5:
+        try:
+            ipaddress.ip_address(fields[4])
+        except ValueError:
+            pass
+        else:
+            return fields[5].lower()
+    return fields[4].lower()
+
+
 def _check_db_probe(cfg: PreflightConfig) -> Item:
     item = Item(id="db.probe", name="数据库连接探测（部署后验证）", status=Status.PASS)
     if not cfg.conninfo:
@@ -336,7 +377,7 @@ def _check_db_probe(cfg: PreflightConfig) -> Item:
     # 优先使用 --pg-bin 下的 psql（与部署一致），不存在时回退 PATH
     psql_bin = os.path.join(cfg.pg_bin, "psql") if os.path.isfile(os.path.join(cfg.pg_bin, "psql")) else "psql"
     rc, out, err = _run(
-        [psql_bin, cfg.conninfo, "-X", "-v", "ON_ERROR_STOP=1", "-Atc", "SELECT 1;"],
+        [psql_bin, f"--dbname={cfg.conninfo}", "-X", "-v", "ON_ERROR_STOP=1", "-Atc", "SELECT 1;"],
         env=env,
         timeout=cfg.timeout,
     )
@@ -344,6 +385,8 @@ def _check_db_probe(cfg: PreflightConfig) -> Item:
     item.evidence = [f"exit_code={rc}"] + ([err[:300]] if err else [])
     if psql_bin != "psql":
         item.evidence.append(f"psql 路径: {psql_bin}（--pg-bin）")
+    else:
+        item.evidence.append("psql 路径: PATH 回退（--pg-bin 下无 psql）")
     if cfg.probe_env:
         # probe_env 可能包含密码类变量（如 PGPASSWORD），显示时脱敏
         shown_env = {
@@ -351,8 +394,18 @@ def _check_db_probe(cfg: PreflightConfig) -> Item:
             for k, v in cfg.probe_env.items()
         }
         item.evidence.append(f"probe env 覆盖: {shown_env}")
-    if rc == 0:
+    if rc == 0 and out.strip() == "1":
         item.summary = "连接成功（SELECT 1 = 1）"
+    elif rc == 0:
+        item.status = Status.FAIL
+        item.summary = "psql 未返回预期探测结果"
+        item.causes = ["连接探测未得到单一结果 1，不能确认数据库连接成功"]
+        item.fix_hint = "核对 psql 输出与连接参数；连接串作为 --dbname 值传入"
+    elif rc == 126:
+        item.status = Status.FAIL
+        item.summary = "psql 执行失败（二进制存在但不可执行）"
+        item.causes = ["psql 权限不足（无执行位）或架构不匹配"]
+        item.fix_hint = "核对 psql 权限与架构，或用 --pg-bin 指向可执行的版本"
     elif rc == 127:
         item.status = Status.FAIL
         # FileNotFoundError 的典型文本为 "[Errno 2] No such file or directory: 'psql'"；

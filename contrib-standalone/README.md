@@ -15,8 +15,8 @@ Checks everything that commonly breaks an OpenTenBase install or start-up:
 | `dir.check` | Missing data/log/config directories and files |
 | `disk.space` | Free disk below `--disk-min-free-gb` |
 | `conf.duplicate_guc` | Same GUC defined multiple times in `postgresql.conf` (last one wins) |
-| `auth.pg_hba_trust` | `trust` rules in `pg_hba.conf` (password check disabled) |
-| `db.probe` | Optional `psql SELECT 1` probe via `--conn`; exit 127 (missing shared libs vs psql not in PATH), connection refused, role/database errors are classified and matched against known failure signatures |
+| `auth.pg_hba_trust` | `trust` authentication methods in `pg_hba.conf` (supports inline comments, quoted fields and legacy separate netmask form; not a full syntax validator) |
+| `db.probe` | Optional `psql SELECT 1` probe via `--conn`; conninfo is bound as one `--dbname=<conninfo>` argument and PASS requires output exactly `1`; exit 127 (missing shared libs vs psql not in PATH), connection refused, role/database errors are classified |
 
 All checks are read-only. Nothing is created, modified, started or stopped.
 
@@ -76,6 +76,9 @@ e.g. no `--conf-files` provided — not a fault).
 The conninfo password is redacted in all tool output (both `key=value` and
 `postgresql://` URI forms, quoted or unquoted). Child-process timeouts do not
 echo the command line. `--probe-env PGPASSWORD=...` values are shown as `***`.
+The probe connection string is passed as a bound psql database-name value, so
+option-like input cannot be interpreted as a psql option or count as a probe
+success without the expected `SELECT 1` output.
 
 ## Relationship to the full toolkit
 
@@ -93,7 +96,7 @@ file for `contrib/` submission:
 
 ## Tests
 
-`tests/test_standalone_preflight.py` (pytest): 59 tests covering every check,
+`tests/test_standalone_preflight.py` (pytest): 63 tests covering every check,
 exit codes 0/1/2/3, conninfo redaction for quoted/URI forms, probe-env password
 redaction, and the exit-127 disambiguation (missing shared libraries vs psql
 not in PATH).

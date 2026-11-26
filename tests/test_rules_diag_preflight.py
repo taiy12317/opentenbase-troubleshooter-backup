@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-from otb_tools import diagnostics, net, preflight
+from otb_tools import diagnostics, log_parser, net, preflight
 from otb_tools.models import Report, Status
 from otb_tools.rules import SQLSTATE_TABLE, match_signatures
 
@@ -101,8 +101,12 @@ class TestDiagnose:
         # 不得由该错误推断「对象是表而非类型」；普通表自动创建同名复合类型
         assert any("复合类型" in s for s in m["next_steps"])
 
-    def test_diagnose_logs_with_fixtures(self):
-        from datetime import timedelta
+    def test_diagnose_logs_with_fixtures(self, monkeypatch):
+        from datetime import datetime, timezone, timedelta
+
+        monkeypatch.setattr(
+            log_parser, "now_utc", lambda: datetime(2026, 11, 21, tzinfo=timezone.utc)
+        )
 
         d = diagnostics.diagnose_logs(
             cn_paths=[os.path.join(FIX, "logs", "cn_sample.log")],
@@ -113,9 +117,10 @@ class TestDiagnose:
         assert "node_state" in d["category_counts"] or "distribution" in d["category_counts"]
         confirmed = [c for c in d["correlations"] if c["confidence"] == "confirmed"]
         assert any(c["coord"] == "2533,76" for c in confirmed)
-        # 关联置信度回答"两侧是否同属执行上下文"；根因判定由错误签名匹配给出
+        # 日志关联识别跨节点异常事件，错误签名提供可能原因及排查建议，均不直接下根因结论
         assert d["root_cause"]["determined"] is False
-        assert "根因判定由错误签名匹配" in d["root_cause"]["note"]
+        assert "日志关联用于识别跨节点异常事件" in d["root_cause"]["note"]
+        assert "错误签名用于提供可能原因及排查建议" in d["root_cause"]["note"]
 
     def test_diagnose_logs_missing_files(self):
         from datetime import timedelta
@@ -153,6 +158,45 @@ class TestDiagnose:
         )
         assert d["unparsed_files"] == []
         assert d["unparsed_lines"] == 0
+
+    def test_diagnose_logs_partial_read_no_false_negative(self, tmp_path, monkeypatch):
+        # 部分文件可读且含错误时结论表述为「可解析部分发现」，不得因另有文件缺失而吞掉
+        from datetime import datetime, timedelta, timezone
+
+        monkeypatch.setattr(
+            log_parser, "now_utc", lambda: datetime(2026, 11, 21, tzinfo=timezone.utc)
+        )
+
+        good = tmp_path / "good.log"
+        good.write_text(
+            "2026-11-20 17:43:54.411 CST [2545,coord(2533,76)] FATAL:  terminating connection due to administrator command\n"
+        )
+        d = diagnostics.diagnose_logs(
+            cn_paths=[str(good), str(tmp_path / "missing.log")],
+            dn_paths=[],
+            window=timedelta(days=30),
+        )
+        assert len(d["read_errors"]) == 1
+        assert "可解析部分发现" in d["conclusion"]
+        assert "时间窗口内未发现 ERROR/FATAL" not in d["conclusion"]
+
+    def test_diagnose_logs_incomplete_no_false_negative(self, tmp_path, monkeypatch):
+        # 存在读取失败且可解析部分无错误：不得输出无条件「未发现 ERROR/FATAL」
+        from datetime import datetime, timedelta, timezone
+
+        monkeypatch.setattr(
+            log_parser, "now_utc", lambda: datetime(2026, 11, 21, tzinfo=timezone.utc)
+        )
+
+        good = tmp_path / "good.log"
+        good.write_text("2026-11-20 17:43:54.411 CST [2545,coord(0,0)] LOG:  InitMultinodeExecutor force:0.\n")
+        d = diagnostics.diagnose_logs(
+            cn_paths=[str(good), str(tmp_path / "missing.log")],
+            dn_paths=[],
+            window=timedelta(days=30),
+        )
+        assert len(d["read_errors"]) == 1
+        assert "时间窗口内未发现 ERROR/FATAL" not in d["conclusion"]
 
     def test_correlation_truncation_keeps_confirmed(self, tmp_path):
         from datetime import datetime, timedelta, timezone
@@ -304,6 +348,29 @@ class TestPreflightUnit:
         assert item.status == Status.WARN
         assert any("trust" in e for e in item.evidence)
 
+    def test_pg_hba_auth_field_handles_comments_quotes_options_and_netmask(self, tmp_path, monkeypatch):
+        from otb_tools.preflight import _check_pg_hba_trust
+
+        cfg = self._cfg(tmp_path, monkeypatch)
+        hba = tmp_path / "pg_hba.conf"
+        hba.write_text(
+            '# full-line comment\n'
+            'local "trust" all scram-sha-256\n'
+            'local "db#name" "user name" trust # quoted hash before method\n'
+            "local all o'brien trust # method followed by comment\n"
+            'host "trust" all 127.0.0.1/32 scram-sha-256\n'
+            'host all all 127.0.0.1/32 md5 map="trust # option" # trailing comment\n'
+            'hostssl all all 127.0.0.1/32 trust clientcert=1 # auth option\n'
+            'host all all 127.0.0.1 255.255.255.255 trust # legacy netmask\n'
+        )
+        cfg.pg_hba_files = [str(hba)]
+        item = _check_pg_hba_trust(cfg)
+        assert item.status == Status.WARN
+        assert item.summary.startswith("4 条 trust 规则")
+        assert any('db#name' in e and 'trust' in e for e in item.evidence)
+        assert any("o'brien trust" in e for e in item.evidence)
+        assert any("255.255.255.255 trust" in e for e in item.evidence)
+
     def test_db_probe_broken_env_127(self, tmp_path, monkeypatch):
         from otb_tools.preflight import _check_db_probe
 
@@ -388,7 +455,46 @@ class TestPreflightUnit:
         item = _check_db_probe(cfg)
         assert item.status == Status.PASS
         assert captured["cmd"][0] == os.path.join(cfg.pg_bin, "psql")
+        assert captured["cmd"][1] == f"--dbname={cfg.conninfo}"
         assert item.source[0].startswith(os.path.join(cfg.pg_bin, "psql"))
+
+    def test_db_probe_does_not_treat_psql_version_output_as_success(self, tmp_path, monkeypatch):
+        from otb_tools.preflight import _check_db_probe
+
+        cfg = self._cfg(tmp_path, monkeypatch)
+        cfg.conninfo = "--version"
+        captured = {}
+
+        def fake_run(cmd, env=None, timeout=10):
+            captured["cmd"] = cmd
+            # Models psql's option behavior if --version were not bound as dbname.
+            return (0, "psql (PostgreSQL) 18.6", "")
+
+        monkeypatch.setattr(preflight, "_run", fake_run)
+        item = _check_db_probe(cfg)
+        assert captured["cmd"][1] == "--dbname=--version"
+        assert item.status == Status.FAIL
+        assert "未返回预期探测结果" in item.summary
+
+    @pytest.mark.parametrize("conninfo", [
+        "host=127.0.0.1 port=15001 dbname=lab user=student",
+        "postgresql://student:p%40ss@127.0.0.1:15001/lab",
+    ])
+    def test_db_probe_binds_keyword_and_uri_conninfo(self, tmp_path, monkeypatch, conninfo):
+        from otb_tools.preflight import _check_db_probe
+
+        cfg = self._cfg(tmp_path, monkeypatch)
+        cfg.conninfo = conninfo
+        captured = {}
+
+        def fake_run(cmd, env=None, timeout=10):
+            captured["cmd"] = cmd
+            return (0, "1", "")
+
+        monkeypatch.setattr(preflight, "_run", fake_run)
+        item = _check_db_probe(cfg)
+        assert item.status == Status.PASS
+        assert captured["cmd"][1] == f"--dbname={conninfo}"
 
     def test_db_probe_falls_back_to_path_psql(self, tmp_path, monkeypatch):
         from otb_tools.preflight import _check_db_probe

@@ -66,7 +66,8 @@ class Item:
 @dataclass
 class Correlation:
     """跨节点日志关联结果。confidence: confirmed / candidate / insufficient，
-    表示两侧日志是否属于同一执行上下文。根因判定由错误签名匹配给出。
+    表示两侧日志是否属于同一执行上下文。日志关联用于识别跨节点异常事件，
+    错误签名用于提供可能原因及排查建议，结合运行状态、错误上下文及验证结果定位具体原因。
     """
 
     coord: str

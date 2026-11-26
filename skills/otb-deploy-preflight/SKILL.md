@@ -7,7 +7,7 @@ description: OpenTenBase 部署环境检查与安装/启动故障排查。当用
 
 ## 用途
 
-在部署/启动 OpenTenBase 之前或启动失败之后，用 `otb-tools preflight` 只读检查环境，逐项给出 PASS/WARN/FAIL、证据和修复建议。本 Skill 不做任何修改操作。
+在部署/启动 OpenTenBase 之前或启动失败之后，用 `otb-tools preflight` 只读检查环境，逐项给出 PASS/WARN/FAIL、证据和修复建议。
 
 职责边界：本 Skill 只处理**部署前/启动前**的环境检查与启动失败排查。集群已运行时做状态巡检、连接失败分析、SQLSTATE 诊断、CN/DN 日志关联，用 otb-cluster-inspector。
 
@@ -43,7 +43,7 @@ workbench exec -i <实例ID> -r cn-beijing --timeout 120 -c \
 | `--data-dirs` / `--log-dir` / `--ports` | 逗号分隔覆盖默认值 |
 | `--compat-dirs` / `--disk-min-free-gb` | 覆盖动态库兼容目录（默认 /opt/opentenbase-lab/compat/{usr/,}lib/x86_64-linux-gnu）与磁盘最小可用空间阈值（默认 1.0GB） |
 | `--conf-files` / `--pg-hba-files` | 逗号分隔配置文件路径（提供后检查重复参数/trust） |
-| `--conn "host=... "` | 提供后追加部署后验证（仅连接探测）；运行期巡检（节点组/2PC/水位/日志关联）由 inspect 负责 |
+| `--conn "host=... "` | 提供后追加部署后验证（仅 `SELECT 1`）；连接串作为 `--dbname=<conninfo>` 单一参数传给 psql，且仅在输出恰为 `1` 时判 PASS；运行期巡检由 inspect 负责 |
 | `--expect-running` | 数据库应已运行：端口未监听、连接拒绝判 FAIL；默认视为部署前（未运行属预期） |
 | `--probe-env "LD_LIBRARY_PATH=/wrong/path"` | 用错误环境复现动态库故障（不改真实环境，只影响 psql 子进程） |
 | `--timeout` / `--output` | 子进程超时秒数（默认 10）/ 报告输出到文件 |
@@ -67,7 +67,7 @@ workbench exec -i <实例ID> -r cn-beijing --timeout 120 -c \
 - 每个检查项含：`status`（PASS/WARN/FAIL/ERROR/SKIP）、`evidence`（原始证据，含子进程退出码）、`facts`（已确认事实）、`possible_causes`、`hypotheses`（待验证假设）、`fix_hint`。
 - 工具退出码：0 无 FAIL 级问题（WARN 允许）/ 1 存在 FAIL（--strict 下 WARN 也计 1）/ 2 执行失败或关键检查不完整 / 3 参数错误。JSON 输出含 `execution_status`（工具是否执行完成）与 `health_status`（环境是否就绪），两者含义不同。
 - 子进程退出码（127 = 动态库缺失或 psql 不在 PATH、2 = 连接失败）只作为 evidence 记录，不透传为工具退出码。
-- `auth.pg_hba_trust` 为 WARN 表示存在 trust 规则（密码校验未生效），实验室单机可接受，生产需评估。
+- `auth.pg_hba_trust` 为 WARN 表示认证方法字段是 `trust`（密码校验未生效），支持 pg_hba 行内注释、双引号字段和旧式独立 netmask 形式；该检查不替代数据库对配置语法的完整验证。
 - 检查项 SKIP 表示条件不满足（如未提供配置文件路径），不是故障。
 
 ## 约束

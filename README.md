@@ -10,7 +10,7 @@
 | Skill：otb-deploy-preflight | `skills/otb-deploy-preflight/` | 部署环境检查与安装/启动故障排查（Agent 调用入口） |
 | Skill：otb-cluster-inspector | `skills/otb-cluster-inspector/` | 集群运行状态巡检与故障诊断（Agent 调用入口） |
 | 故障知识库 | `references/error-cases.md` | 错误签名 / SQLSTATE / 跨节点关联机制，来源为真实复现与社区 issue 实证 |
-| 独立预检工具 | `contrib-standalone/otb_preflight.py` | 零第三方依赖的单文件版本，作为向 OpenTenBase 主仓库贡献的最小候选物 |
+| 独立预检工具 | `contrib-standalone/otb_preflight.py` | 零第三方依赖的单文件预检脚本（preflight 核心检查的独立实现） |
 
 ## 2. 安装
 
@@ -18,8 +18,8 @@ Python ≥ 3.9（开发验证于 3.10.12 / 3.14.7）。
 
 ```bash
 git clone https://github.com/taiy12317/opentenbase-troubleshooter.git
-cd opentenbase-troubleshooter     # 目录名即仓库名；pip 分布名为 otb-troubleshooting-toolkit
-pip install -e '.[db]'           # 巡检（inspect）需要 psycopg2；开发/跑测试用 '.[test]'
+cd opentenbase-troubleshooter
+pip install -e '.[db,test]'         # db=psycopg2（inspect 需要）；test=pytest（跑测试）
 ```
 
 不经安装也可直接运行：
@@ -64,7 +64,8 @@ otb-tools inspect --conn "host=127.0.0.1 port=15001 dbname=lab user=<用户>" \
 检查项：CN 连接、pgxc_node 注册、pgxc_group、注册端口 vs 实际监听、节点进程、CN→DN 直连、跨节点生效参数对比、会话与连接水位、pg_prepared_xacts、数据分布与倾斜、错误日志扫描、基于 `coord(pid,vxid)` 的 CN/DN 跨节点日志关联。
 
 - 数据库连接失败时，进程/端口/日志等节点级检查继续执行，依赖数据库的项标记 SKIP，退出码 2；
-- 数据倾斜（`data.skew`）：按 `xc_node_id` 统计各分片表在各 DN 的行数。最大/最小 ≥ 2 判 WARN；完全倾斜（存在 0 行节点）且总行数 ≥ 1 万判 FAIL，否则降级 WARN。行数不均衡影响并行查询性能与节点负载均衡，不影响查询正确性，也可能是有意为之。`reltuples` 超过 `--skew-max-rows`（默认 10 万）或未 ANALYZE 的表默认不精确扫描（`--skew-tables` 可显式强制），并基于 `pg_stats` 给出零扫描倾斜风险提示（仅提示，不参与判定）。
+- 数据倾斜（`data.skew`）：按 `xc_node_id` 统计各 DN 行数；最大/最小 ≥ 2 判 WARN；完全倾斜（存在 0 行节点）且总行数 ≥ 1 万判 FAIL，否则降级 WARN。行数不均衡影响性能与负载均衡，不影响查询正确性；分布节点范围元数据异常（nodeoids 无法映射、出现范围外/未注册节点）时只报告、不判定。超 `--skew-max-rows`（默认 10 万）或未 ANALYZE 的表默认不精确扫描，`--skew-tables` 可显式强制；
+- 不依赖本环境不可用或默认关闭的接口（`pg_stat_statements`、`pgxc_lock_for_backends`、`pg_current_setting`、`pg_file_settings`、EXECUTE DIRECT、csvlog global trace id），替代方案见 `references/error-cases.md`；非 superuser 时部分采集接口受限，按知识库记录的替代方案处理。
 
 ### 3.3 诊断（diagnose）
 
@@ -75,8 +76,9 @@ otb-tools diagnose --cn-logs /data/opentenbase-lab/logs/cn.log \
   --dn-logs /data/opentenbase-lab/logs/dn1.log,/data/opentenbase-lab/logs/dn2.log --window-hours 168
 ```
 
-- 文本诊断分层匹配：完整具体错误文本命中具体签名（confirmed）；短症状文本（如裸 `Connection refused`）命中通用类别签名（candidate，只识别类别）；无命中时输出未匹配说明，不猜测根因；
-- 日志关联置信度：`confirmed`（双侧事件、时间窗口内）/ `candidate`（级别不足或疑似 PID 复用）/ `insufficient`（对侧无记录）。置信度表示两侧日志是否属于同一执行上下文；根因判定由错误签名匹配给出（JSON 的 `root_cause` 字段显式区分）。
+- 文本诊断分层匹配：完整具体错误文本命中具体签名（confirmed）；短症状文本（如裸 `Connection refused`）命中通用类别签名（candidate，只识别类别）；无命中时输出未匹配说明并给出进一步排查建议（可补充 SQLSTATE 或节点日志）；
+- 日志关联置信度：`confirmed` 要求双侧事件在配对窗口内且 CN 来源身份无歧义；级别不足、疑似 PID 复用或同一 DN 配对窗口内出现多个不同 CN 来源时标为 `candidate`；对侧无记录为 `insufficient`。`diagnose` 未提供 CN 节点名时以日志来源文件区分；多文件轮转与多 CN 无法区分时保守标为候选，不按文件名猜测节点身份。日志关联用于识别跨节点异常事件，错误签名用于提供可能原因及排查建议，结合运行状态、错误上下文及验证结果定位具体原因（JSON 的 `root_cause` 字段显式区分）；
+- 日志关联基于默认 stderr 格式的 `coord(pid,vxid)` 字段；需要 CN/DN 日志均提供，单侧日志关联标记为 `insufficient`；日志解析为全量读入内存（1000 万行 / 1.1GB 实测可处理，耗时与内存见 `测试报告.md` 第九章）。
 
 ### 3.4 退出码
 
@@ -126,27 +128,20 @@ cp -r skills/otb-cluster-inspector ~/.qoder-cn/skills/
 
 ## 6. 只读与安全保证
 
-- 全部检查只读：数据库会话带 `default_transaction_read_only=on`；进程/端口/日志仅观察；无任何写操作路径；
-- 子进程退出码（如 127）只进入 evidence，不直接映射为工具退出码；
+- 检查按只读方式执行：`inspect` 数据库会话设置 `default_transaction_read_only=on`；`preflight` 仅执行固定的 `SELECT 1`；进程/端口/日志检查仅读取；
 - 连接串在输出前脱敏（password=***，支持 key=value 与 URI 两种形式）；仓库与报告不含真实凭据，连接凭据一律经 `--conn` 显式提供；
-- 外部命令参数与 SQL 标识符均经安全处理（psql 探测用参数数组、节点名仅用于展示）。
+- psql 探测将完整连接串作为单一 `--dbname=<conninfo>` 值传入，避免其中以 `-` 开头的内容变成 psql 选项；只有退出码为 0 且标准输出恰为 `1` 才判定连接成功。
+- pg_hba 检查按 `local` / `host*` 记录字段位置识别认证方法，支持行内注释、双引号字段与独立 netmask；它不替代数据库自身对配置语法的完整校验。
 
-## 7. 已知限制
-
-- 不依赖以下接口（在本环境验证不可用、需 superuser 或默认关闭，替代方案见 `references/error-cases.md`）：`pg_stat_statements`、`pgxc_lock_for_backends`、`pg_current_setting`、`pg_file_settings`、EXECUTE DIRECT、csvlog global trace id；
-- 日志关联仅覆盖默认 stderr 格式（`log_line_prefix='%m [%p] '`）；需要 CN/DN 日志均提供，缺一侧时如实标记 insufficient，不做推断；
-- 日志解析为全量读入内存（实验规模约 1.8 万行无压力；超大日志建议外部先做时间裁剪）；
-- 非 superuser 场景的采集接口受限，故障知识库中记录了替代方案。
-
-## 8. 测试
+## 7. 测试
 
 ```bash
-.venv/bin/python -m pytest tests/ -q   # 218 项单元测试
+.venv/bin/python -m pytest tests/ -q   # 2026-11-26：242 passed
 ```
 
 集成验证（真实集群 8 场景 + 数据倾斜检查）见 `测试报告.md`；实际使用场景见 `演示记录.md`。
 
-## 9. 仓库结构
+## 8. 仓库结构
 
 | 路径 | 内容 |
 |---|---|
@@ -155,5 +150,5 @@ cp -r skills/otb-cluster-inspector ~/.qoder-cn/skills/
 | `references/error-cases.md` | 故障知识库 |
 | `contrib-standalone/otb_preflight.py` | 零依赖单文件预检脚本 |
 | `examples/` | diagnose 三条路径的真实运行产物 |
-| `tests/` | 单元测试（218 项） |
+| `tests/` | 单元测试（242 项） |
 | `测试报告.md` / `演示记录.md` | 测试结果与使用场景 |

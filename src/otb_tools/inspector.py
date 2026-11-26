@@ -98,6 +98,8 @@ def _run(cmd: list[str], timeout: int = 5) -> tuple[int, str, str]:
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
     except FileNotFoundError as exc:
         return 127, "", str(exc)
+    except OSError as exc:
+        return 126, "", str(exc)
     except subprocess.TimeoutExpired:
         return 124, "", f"command timed out after {timeout}s"
 
@@ -234,10 +236,16 @@ def run(cfg: InspectorConfig, strict: bool = False) -> Report:
             direct_item.status = Status.FAIL
             direct_item.evidence.append(f"{label}: 注册信息缺少端口，无法构造直连")
             continue
+        try:
+            port = int(n["node_port"])
+        except (TypeError, ValueError):
+            direct_item.status = Status.FAIL
+            direct_item.evidence.append(f"{label}: 注册端口无效（{n.get('node_port')!r}），无法构造直连")
+            continue
         dn_conn = None
         try:
             dn_conn = connect(
-                _conninfo_for_node(cfg.conninfo, host=n.get("node_host") or "", port=int(n["node_port"])),
+                _conninfo_for_node(cfg.conninfo, host=n.get("node_host") or "", port=port),
                 timeout=cfg.timeout,
             )
             rows, _ = run_sql(dn_conn, "SELECT current_setting('port');")
@@ -272,14 +280,20 @@ def run(cfg: InspectorConfig, strict: bool = False) -> Report:
             if n["node_type"] == "G":
                 skipped_gtm.append(n["node_name"])
             continue
-        if n.get("node_port"):
-            # C/D 统一按注册 host/port 构造连接：多 CN 部署下每个 CN 连自己的注册地址
-            targets.append((
-                n["node_name"],
-                _conninfo_for_node(cfg.conninfo, host=n.get("node_host") or "", port=int(n["node_port"])),
-            ))
-        else:
+        raw_port = n.get("node_port")
+        if raw_port in (None, ""):
             effective[n["node_name"]] = {"_error": "注册信息缺少端口，无法构造连接"}
+            continue
+        try:
+            port = int(raw_port)
+        except (TypeError, ValueError):
+            effective[n["node_name"]] = {"_error": f"注册端口无效（{raw_port!r}），无法构造连接"}
+            continue
+        # C/D 统一按注册 host/port 构造连接：多 CN 部署下每个 CN 连自己的注册地址
+        targets.append((
+            n["node_name"],
+            _conninfo_for_node(cfg.conninfo, host=n.get("node_host") or "", port=port),
+        ))
     seen_names = set()
     for name, conninfo in targets:
         if name in seen_names:
@@ -313,13 +327,21 @@ def run(cfg: InspectorConfig, strict: bool = False) -> Report:
     errors = [name for name, vals in effective.items() if "_error" in vals]
     if skipped_gtm:
         cfg_item.facts.append(f"{'、'.join(skipped_gtm)} 为 GTM 协议节点，不参与配置对比")
+    # 参数级采集失败分级：全部可达节点均失败（total_fail，证据缺失）与部分节点
+    # 失败（partial_fail，对比基于已采集子集）状态语义不同，不得混为「取值一致」。
     total_fail = [
         p for p in COMPARABLE_PARAMS
         if perr.get(p) and not any(isinstance(v.get(p), str) for v in collected.values())
     ]
+    partial_fail = [
+        p for p in COMPARABLE_PARAMS
+        if perr.get(p) and any(isinstance(v.get(p), str) for v in collected.values())
+    ]
     if diffs:
         cfg_item.facts.append(f"参数 {', '.join(p for p, _ in diffs)} 在已采集节点间取值不同"
                               + (f"（仅 {len(collected)}/{len(effective)} 个节点采集成功，统计基于该子集）" if errors else ""))
+    if partial_fail:
+        cfg_item.facts.append(f"参数 {', '.join(partial_fail)} 在部分节点采集失败（对比基于已采集数据）")
     if not targets and not effective:
         cfg_item.status = Status.SKIP
         cfg_item.summary = "注册节点中无 C/D 节点可对比配置"
@@ -338,6 +360,10 @@ def run(cfg: InspectorConfig, strict: bool = False) -> Report:
         cfg_item.status = Status.WARN
         cfg_item.summary = "节点间存在参数差异"
         cfg_item.causes = ["参数差异可能来自部署意图（如各节点规格不同），结合部署配置判断是否需要统一"]
+    elif partial_fail:
+        cfg_item.status = Status.WARN
+        cfg_item.summary = f"参数 {', '.join(partial_fail)} 在部分节点采集失败（对比基于已采集数据）"
+        cfg_item.causes = ["权限不足或版本差异导致部分节点无法读取该参数；一致结论不覆盖未采集的节点"]
     else:
         cfg_item.summary = "对比参数取值一致"
     report.items.append(cfg_item)
@@ -559,6 +585,7 @@ def _skew_item(conn, nodes: list[dict], cfg: InspectorConfig) -> Item:
     scanned = 0
     skipped = 0
     warn_tables: list[str] = []
+    meta_tables: list[str] = []
     fail_tables: list[str] = []
     scan_errors: list[str] = []
     for oid, nsp, rel, reltuples, locator, discolnums_text, nodeoids_text in rows:
@@ -600,47 +627,62 @@ def _skew_item(conn, nodes: list[dict], cfg: InspectorConfig) -> Item:
             scanned += 1
             continue
         parts = [f"{id_to_name.get(rid, f'node_{rid}')}={cnt}" for rid, cnt in sorted(counts.items())]
-        unknown_ids = [rid for rid in counts if rid not in id_to_name]
-        if unknown_ids:
-            item.facts.append(f"{qualified}: 行数统计含未注册到 pgxc_node 的 xc_node_id {sorted(unknown_ids)}（分布元数据与注册信息不一致）")
-        # 期望节点范围：pgxc_class.nodeoids（表级分布节点）优先；为空时按集群 DN 数推断
-        expected_names = None
+        unknown_ids = sorted(rid for rid in counts if rid not in id_to_name)
+        # 期望节点范围：pgxc_class.nodeoids（表级分布节点）优先；缺失/无法映射时按集群 DN 集。
+        # 节点范围不可靠（meta_problem）时单独报告，不基于不可靠范围下均衡结论。
+        expected_names: list[str] | None = None
+        meta_problem = False
         if nodeoids_text and oid_to_name:
             oids = []
+            unparsed = 0
             for tok in nodeoids_text.split():
                 try:
                     oids.append(int(tok))
                 except ValueError:
-                    pass
-            if oids:
-                matched = [oid_to_name[o] for o in oids if o in oid_to_name]
-                if matched:
-                    expected_names = matched
-                if len(matched) != len(oids):
-                    item.facts.append(f"{qualified}: pgxc_class.nodeoids 含 {len(oids) - len(matched)} 个未匹配 pgxc_node.oid 的节点")
-        expected_count = len(expected_names) if expected_names is not None else len(dn_names)
-        missing = expected_count - len(counts)
-        if missing > 0:
-            if expected_names is not None:
-                counted_names = {id_to_name[rid] for rid in counts if rid in id_to_name}
-                zero_names = sorted(set(expected_names) - counted_names)
-                if zero_names:
-                    parts.append(f"{'、'.join(zero_names)}=0 行")
-                else:
-                    parts.append(f"其余 {missing} 个节点=0 行")
-            else:
-                parts.append(f"其余 {missing} 个 DN=0 行")
+                    unparsed += 1
+            matched = [oid_to_name[o] for o in oids if o in oid_to_name]
+            if oids and len(matched) == len(oids):
+                expected_names = matched
+                if unparsed:
+                    meta_problem = True
+                    item.facts.append(
+                        f"{qualified}: pgxc_class.nodeoids 含 {unparsed} 个无法解析的节点标识（节点范围可能不完整）")
+            elif oids:
+                meta_problem = True
+                item.facts.append(
+                    f"{qualified}: pgxc_class.nodeoids 中 {len(oids) - len(matched)} 个节点 oid 无法映射到 pgxc_node（节点范围不可靠）")
+            elif unparsed:
+                meta_problem = True
+                item.facts.append(f"{qualified}: pgxc_class.nodeoids 无法解析（节点范围不可靠）")
+        expected = set(expected_names) if expected_names is not None else set(dn_names)
+        actual_names = {id_to_name[rid] for rid in counts if rid in id_to_name}
+        unexpected = sorted(actual_names - expected)
+        if unexpected:
+            meta_problem = True
+            item.facts.append(f"{qualified}: 行数统计含分布范围外的节点 {unexpected}（分布元数据与注册信息不一致）")
+        if unknown_ids:
+            meta_problem = True
+            item.facts.append(
+                f"{qualified}: 行数统计含未注册到 pgxc_node 的 xc_node_id {unknown_ids}（分布元数据与注册信息不一致）")
+        # 节点范围可靠（nodeoids 完整映射或回退集群 DN 集，且无范围外/未注册节点）
+        # 才可断言 0 行节点；范围不可靠时只报元数据异常，不下倾斜结论。
+        missing = sorted(expected - actual_names) if not meta_problem else []
+        if missing:
+            parts.append(f"{'、'.join(missing)}=0 行")
         maxv = max(counts.values())
-        minv = min(counts.values()) if missing <= 0 else 0
+        minv = min(counts.values()) if not missing else 0
         ratio = maxv / minv if minv else float("inf")
         line = f"{qualified}: " + " ".join(parts) + f"（总计 {total}，最大/最小={ratio:.2f}）"
-        if minv == 0:
+        if missing:
             if total >= cfg.skew_fail_min_rows:
                 fail_tables.append(qualified)
                 line += " → 完全倾斜（存在 0 行节点）"
             else:
                 warn_tables.append(qualified)
                 line += " → 完全倾斜但总行数低于 FAIL 阈值，降级 WARN"
+        elif meta_problem:
+            meta_tables.append(qualified)
+            line += " → 分布元数据异常（节点范围不可靠），不判定均衡"
         elif ratio >= SKEW_WARN_RATIO:
             warn_tables.append(qualified)
             line += " → 行数不均衡"
@@ -658,11 +700,18 @@ def _skew_item(conn, nodes: list[dict], cfg: InspectorConfig) -> Item:
         item.summary = f"{len(fail_tables)} 张表完全倾斜：{', '.join(fail_tables)}"
         item.causes = ["分布列取值高度集中（哈希分片后数据落在单一节点）", "分布列选择不当或数据本身特征", "也可能是有意为之，需结合业务意图判断"]
         item.fix_hint = "核对分布列（pgxc_class.discolnums）；调整分布需重建表：CREATE TABLE ... DISTRIBUTE BY SHARD(列) 后迁移数据"
-    elif warn_tables:
+    elif warn_tables or meta_tables:
         item.status = Status.WARN
-        item.summary = f"{len(warn_tables)} 张表行数不均衡：{', '.join(warn_tables)}"
-        item.causes = ["分布列不同值数量少或取值偏斜", "行数不均衡影响并行查询性能与节点负载均衡，不影响查询正确性；结合业务数据特征评估分布列"]
-        item.fix_hint = "结合业务评估分布列选择；调整需重建表（见 error-cases.md 数据倾斜条目）"
+        parts_s = []
+        if warn_tables:
+            parts_s.append(f"{len(warn_tables)} 张表行数不均衡：{', '.join(warn_tables)}")
+        if meta_tables:
+            parts_s.append(f"{len(meta_tables)} 张表分布元数据异常：{', '.join(meta_tables)}")
+        item.summary = "；".join(parts_s)
+        item.causes = ["分布列不同值数量少或取值偏斜",
+                       "行数不均衡影响并行查询性能与节点负载均衡，不影响查询正确性；结合业务数据特征评估分布列",
+                       "分布元数据与注册信息不一致（nodeoids 无法映射、出现范围外节点）时，节点范围不可靠，不判定均衡"]
+        item.fix_hint = "结合业务评估分布列选择；调整需重建表（见 error-cases.md 数据倾斜条目）；元数据异常先核对 pgxc_class 与 pgxc_node 的对应关系"
     elif scanned:
         item.summary = f"{scanned} 张分片表行数均衡" + (f"（{skipped} 张复制/本地/超阈值表跳过）" if skipped else "")
     else:
@@ -713,6 +762,7 @@ def _append_log_checks(report: Report, cfg: InspectorConfig, nodes: list[dict]) 
     scan_item = Item(id="logs.scan", name="错误日志扫描", status=Status.PASS)
     entries: dict[str, list[log_parser.LogEntry]] = {}
     read_errors: list[str] = []
+    failed_nodes: set[str] = set()
     unparsed_total = 0
     format_mismatch: list[str] = []
     for node, fname in cfg.log_files.items():
@@ -722,11 +772,13 @@ def _append_log_checks(report: Report, cfg: InspectorConfig, nodes: list[dict]) 
             es, unparsed = log_parser.parse_file(path, node=node)
         except OSError as exc:
             read_errors.append(f"{path}: {exc}")
+            failed_nodes.add(node)
             continue
         unparsed_total += unparsed
         entries[node] = es
         if not es and unparsed > 0:
             format_mismatch.append(f"{node}: {unparsed} 行全部无法解析")
+            failed_nodes.add(node)
         errors = [e for e in es if e.level in log_parser.ERROR_LEVELS and e.ts >= cutoff]
         if errors:
             scan_item.evidence.append(f"{node}: 窗口内 ERROR/FATAL {len(errors)} 条")
@@ -756,7 +808,8 @@ def _append_log_checks(report: Report, cfg: InspectorConfig, nodes: list[dict]) 
             scan_item.status = Status.WARN
             scan_item.facts = ["窗口内错误已按时间列出；结合发生时间与关联判断与当前问题的相关性"]
     scan_item.source = [os.path.join(cfg.log_dir, f) if not os.path.isabs(f) else f for f in cfg.log_files.values()]
-    scan_item.facts.append(f"未解析行共 {unparsed_total}（格式不符的非标准行）")
+    if unparsed_total:
+        scan_item.facts.append(f"未解析行共 {unparsed_total}（格式不符的非标准行）")
     report.items.append(scan_item)
 
     # 跨节点关联：CN 与各 DN
@@ -784,12 +837,16 @@ def _append_log_checks(report: Report, cfg: InspectorConfig, nodes: list[dict]) 
     corr_item.evidence = [
         f"confirmed {len(confirmed)} / candidate {len([c for c in corr_in_window if c['confidence']=='candidate'])} / insufficient {len([c for c in corr_in_window if c['confidence']=='insufficient'])}"
     ]
-    corr_item.facts.append("关联置信度表示两侧日志是否属于同一执行上下文；根因判定由错误签名匹配给出（见 diagnose）")
+    corr_item.facts.append("关联置信度表示两侧日志是否属于同一执行上下文；错误签名用于提供可能原因及排查建议（见 diagnose）")
     if confirmed:
         corr_item.status = Status.FAIL
         corr_item.summary = f"{len(confirmed)} 条确认关联（CN/DN 双侧事件，属明确异常）"
         corr_item.causes = ["窗口内存在跨节点故障事件，详见 correlations 输出"]
-        corr_item.fix_hint = "结合确认关联的 coord 与错误文本签名（diagnose）定位根因"
+        corr_item.fix_hint = "结合确认关联的 coord 与错误文本签名（diagnose）定位具体原因"
+    elif set(cn_nodes) & failed_nodes or set(dn_nodes) & failed_nodes:
+        corr_item.status = Status.ERROR
+        corr_item.summary = "部分 CN/DN 日志缺失或无法解析，关联证据不完整"
+        corr_item.causes = ["无确认关联不代表无跨节点事件：缺失侧日志可能正包含对应记录"]
     else:
         corr_item.summary = "窗口内无确认关联事件"
     report.items.append(corr_item)

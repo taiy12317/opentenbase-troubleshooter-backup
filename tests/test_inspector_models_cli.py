@@ -3,7 +3,7 @@ import os
 
 import pytest
 
-from otb_tools import cli, inspector, net
+from otb_tools import cli, inspector, log_parser, net
 from otb_tools.models import Item, Report, Status
 
 FIX = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -53,7 +53,12 @@ class TestInspectorUnit:
         assert report.items[0].id == "db.connect"
         assert "psycopg2" in report.items[0].summary
 
-    def test_log_checks_with_fixtures(self, tmp_path):
+    def test_log_checks_with_fixtures(self, tmp_path, monkeypatch):
+        from datetime import datetime, timezone
+
+        monkeypatch.setattr(
+            log_parser, "now_utc", lambda: datetime(2026, 11, 21, tzinfo=timezone.utc)
+        )
         cfg = inspector.InspectorConfig(
             log_dir="",
             log_files={
@@ -84,6 +89,52 @@ class TestInspectorUnit:
         assert items["logs.scan"].status == Status.ERROR
         assert "证据不完整" in items["logs.scan"].summary
         assert items["logs.correlate"].status == Status.SKIP
+
+    def test_log_correlate_one_side_missing_is_error(self, tmp_path):
+        # 单侧日志缺失时不得输出「窗口内无确认关联事件」PASS
+        cn = tmp_path / "cn.log"
+        cn.write_text("2026-11-20 17:43:54.411 CST [1000,coord(1000,1)] LOG:  some message\n")
+        cfg = inspector.InspectorConfig(
+            log_dir=str(tmp_path),
+            log_files={"cn": "cn.log", "dn1": "missing_dn1.log"},
+        )
+        report = Report(command="inspect")
+        inspector._append_log_checks(report, cfg, [])
+        items = {i.id: i for i in report.items}
+        assert items["logs.scan"].status == Status.ERROR
+        assert items["logs.correlate"].status == Status.ERROR
+        assert "关联证据不完整" in items["logs.correlate"].summary
+
+    def test_log_correlate_one_side_unparsable_is_error(self, tmp_path):
+        cn = tmp_path / "cn.log"
+        dn = tmp_path / "dn1.log"
+        cn.write_text("2026-11-20 17:43:54.411 CST [1000,coord(1000,1)] LOG:  some message\n")
+        dn.write_text("not a log line\nanother garbage\n")
+        cfg = inspector.InspectorConfig(
+            log_dir=str(tmp_path),
+            log_files={"cn": "cn.log", "dn1": "dn1.log"},
+        )
+        report = Report(command="inspect")
+        inspector._append_log_checks(report, cfg, [])
+        items = {i.id: i for i in report.items}
+        assert items["logs.scan"].status == Status.ERROR
+        assert items["logs.correlate"].status == Status.ERROR
+        assert "关联证据不完整" in items["logs.correlate"].summary
+
+    def test_log_checks_all_empty_files_ok(self, tmp_path):
+        # 日志文件存在但为空：正常状态，不报 ERROR
+        (tmp_path / "cn.log").write_text("")
+        (tmp_path / "dn1.log").write_text("")
+        cfg = inspector.InspectorConfig(
+            log_dir=str(tmp_path),
+            log_files={"cn": "cn.log", "dn1": "dn1.log"},
+        )
+        report = Report(command="inspect")
+        inspector._append_log_checks(report, cfg, [])
+        items = {i.id: i for i in report.items}
+        assert items["logs.scan"].status == Status.PASS
+        assert "窗口内 0 条" in items["logs.scan"].summary
+        assert items["logs.correlate"].status == Status.PASS
 
     def test_dn_only_insufficient_correlation_no_crash(self, tmp_path):
         # 回归：DN 有 coord 键而 CN 无同键记录时，correlation 的 cn_entry 为空，
@@ -239,6 +290,19 @@ class TestCli:
         with pytest.raises(SystemExit) as ei:
             cli.main(["inspect", "--watermark-threshold", "1.5"])
         assert ei.value.code == 3
+
+    def test_float_params_reject_nan_inf_exit_3(self):
+        for args in (
+            ["inspect", "--watermark-threshold", "nan"],
+            ["inspect", "--watermark-threshold", "inf"],
+            ["inspect", "--log-window-hours", "inf"],
+            ["preflight", "--disk-min-free-gb", "nan"],
+            ["preflight", "--disk-min-free-gb", "inf"],
+            ["diagnose", "--window-hours", "inf"],
+        ):
+            with pytest.raises(SystemExit) as ei:
+                cli.main(args)
+            assert ei.value.code == 3
 
     def test_diagnose_window_hours_non_positive_exit_3(self):
         with pytest.raises(SystemExit) as ei:

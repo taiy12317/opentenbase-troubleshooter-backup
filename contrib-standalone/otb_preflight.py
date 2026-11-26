@@ -24,8 +24,10 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -387,7 +389,7 @@ def check_pg_hba_trust(args):
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 for lineno, line in enumerate(fh, 1):
                     stripped = line.strip()
-                    if stripped and not stripped.startswith("#") and stripped.split()[-1] == "trust":
+                    if pg_hba_auth_method(stripped) == "trust":
                         trust_lines.append(f"{path}:{lineno}: {stripped}")
         except OSError as exc:
             item.status = STATUS_ERROR
@@ -404,6 +406,35 @@ def check_pg_hba_trust(args):
     return item
 
 
+def pg_hba_auth_method(line):
+    """Extract a pg_hba method field; this is not a full config validator."""
+    lexer = shlex.shlex(line, posix=True)
+    lexer.quotes = '"'
+    lexer.whitespace_split = True
+    lexer.commenters = "#"
+    try:
+        fields = list(lexer)
+    except ValueError:
+        return None
+    if not fields:
+        return None
+    record = fields[0].lower()
+    if record == "local":
+        return fields[3].lower() if len(fields) > 3 else None
+    if record not in ("host", "hostssl", "hostnossl", "hostgssenc", "hostnogssenc"):
+        return None
+    if len(fields) < 5:
+        return None
+    if len(fields) > 5:
+        try:
+            ipaddress.ip_address(fields[4])
+        except ValueError:
+            pass
+        else:
+            return fields[5].lower()
+    return fields[4].lower()
+
+
 def check_db_probe(args):
     item = Item("db.probe", "数据库连接探测（部署后验证）")
     if not args.conn:
@@ -416,7 +447,7 @@ def check_db_probe(args):
         env[k] = v
     psql_bin = os.path.join(args.pg_bin, "psql") if os.path.isfile(os.path.join(args.pg_bin, "psql")) else "psql"
     rc, out, err = _run(
-        [psql_bin, args.conn, "-X", "-v", "ON_ERROR_STOP=1", "-Atc", "SELECT 1;"],
+        [psql_bin, f"--dbname={args.conn}", "-X", "-v", "ON_ERROR_STOP=1", "-Atc", "SELECT 1;"],
         env=env,
         timeout=args.timeout,
     )
@@ -431,8 +462,13 @@ def check_db_probe(args):
                 v = "***"
             shown.append(f"{k}={v}")
         item.evidence.append(f"probe env 覆盖: {shown}")
-    if rc == 0:
+    if rc == 0 and out.strip() == "1":
         item.summary = "连接成功（SELECT 1 = 1）"
+    elif rc == 0:
+        item.status = STATUS_FAIL
+        item.summary = "psql 未返回预期探测结果"
+        item.causes = ["连接探测未得到单一结果 1，不能确认数据库连接成功"]
+        item.fix_hint = "核对 psql 输出与连接参数；连接串作为 --dbname 值传入"
     elif rc == 127:
         item.status = STATUS_FAIL
         # FileNotFoundError 文本为 "[Errno 2] No such file or directory: 'psql'"；

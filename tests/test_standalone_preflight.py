@@ -252,6 +252,27 @@ class TestPgHbaTrust:
         cfg.pg_hba_files = [hba]
         assert sf.check_pg_hba_trust(cfg).status == sf.STATUS_PASS
 
+    def test_auth_field_handles_comments_quotes_options_and_netmask(self, cfg):
+        hba = os.path.join(cfg.log_dir, "pg_hba.conf")
+        with open(hba, "w") as fh:
+            fh.write(
+                '# full-line comment\n'
+                'local "trust" all scram-sha-256\n'
+                'local "db#name" "user name" trust # quoted hash before method\n'
+                "local all o'brien trust # method followed by comment\n"
+                'host "trust" all 127.0.0.1/32 scram-sha-256\n'
+                'host all all 127.0.0.1/32 md5 map="trust # option" # trailing comment\n'
+                'hostssl all all 127.0.0.1/32 trust clientcert=1 # auth option\n'
+                'host all all 127.0.0.1 255.255.255.255 trust # legacy netmask\n'
+            )
+        cfg.pg_hba_files = [hba]
+        item = sf.check_pg_hba_trust(cfg)
+        assert item.status == sf.STATUS_WARN
+        assert item.summary.startswith("4 条 trust 规则")
+        assert any('db#name' in e and 'trust' in e for e in item.evidence)
+        assert any("o'brien trust" in e for e in item.evidence)
+        assert any("255.255.255.255 trust" in e for e in item.evidence)
+
 
 class TestDbProbe:
     def test_no_conn_skips(self, cfg):
@@ -262,6 +283,37 @@ class TestDbProbe:
         monkeypatch.setattr(sf, "_run", lambda cmd, env=None, timeout=10: (0, "1", ""))
         item = sf.check_db_probe(cfg)
         assert item.status == sf.STATUS_PASS
+
+    def test_psql_version_option_is_bound_and_cannot_pass_probe(self, cfg, monkeypatch):
+        cfg.conn = "--version"
+        captured = {}
+
+        def fake_run(cmd, env=None, timeout=10):
+            captured["cmd"] = cmd
+            return (0, "psql (PostgreSQL) 18.6", "")
+
+        monkeypatch.setattr(sf, "_run", fake_run)
+        item = sf.check_db_probe(cfg)
+        assert captured["cmd"][1] == "--dbname=--version"
+        assert item.status == sf.STATUS_FAIL
+        assert "未返回预期探测结果" in item.summary
+
+    @pytest.mark.parametrize("conninfo", [
+        "host=127.0.0.1 port=15001 dbname=lab user=student",
+        "postgresql://student:p%40ss@127.0.0.1:15001/lab",
+    ])
+    def test_keyword_and_uri_conninfo_are_bound(self, cfg, monkeypatch, conninfo):
+        cfg.conn = conninfo
+        captured = {}
+
+        def fake_run(cmd, env=None, timeout=10):
+            captured["cmd"] = cmd
+            return (0, "1", "")
+
+        monkeypatch.setattr(sf, "_run", fake_run)
+        item = sf.check_db_probe(cfg)
+        assert item.status == sf.STATUS_PASS
+        assert captured["cmd"][1] == f"--dbname={conninfo}"
 
     def test_dynlib_missing_127(self, cfg, monkeypatch):
         cfg.conn = "host=127.0.0.1 port=15001"
